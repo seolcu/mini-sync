@@ -1,4 +1,3 @@
-```md
 # mini-sync — AGENTS.md
 
 mini-sync는 **Standalone WM/Compositor(Sway/Hyprland 등) 사용자**를 위한 **PC ↔ Android** “딱 필요한 것만” 도구다.
@@ -12,26 +11,28 @@ mini-sync는 **Standalone WM/Compositor(Sway/Hyprland 등) 사용자**를 위한
 ## 1) 제품 정의
 
 ### 1.1 MVP(반드시)
-1) **페어링**
+
+1. **페어링**
    - 같은 LAN에서 기기 발견
    - QR 코드 또는 짧은 코드로 페어링
    - 페어링된 기기 목록 관리(추가/삭제/상태)
 
-2) **파일 공유**
+2. **파일 공유**
    - PC → Android: 파일/폴더(폴더는 zip 처리 가능) 전송
    - Android → PC: Android Share Intent로 전송(파일 1개부터 시작해도 OK)
    - 수신 시 저장 위치 지정(최소한 기본 폴더 제공)
 
-3) **클립보드 동기화(텍스트 우선)**
+3. **클립보드 동기화(텍스트 우선)**
    - PC → Android, Android → PC 모두
    - “자동 동기화(Watch)” 옵션 + “수동 Push” 옵션 제공
    - 충돌 정책: **Last-write-wins** (timestamp + source device id)
 
-4) **보안**
+4. **보안**
    - 페어링 이후 모든 통신은 **암호화 + 인증**
    - 동일 LAN이라도 “그냥 평문” 금지
 
 ### 1.2 Non-goals(지금은 안 함)
+
 - 화면 미러링/원격 입력, SMS 연동, 전화 알림 연동
 - GNOME/KDE 수준의 파일관리자 확장(나중에 가능)
 - 이미지/바이너리 클립보드 동기화(1차 MVP에서는 텍스트만)
@@ -41,12 +42,14 @@ mini-sync는 **Standalone WM/Compositor(Sway/Hyprland 등) 사용자**를 위한
 ## 2) 플랫폼/기술 선택(권장)
 
 ### 2.1 Desktop(Linux) — 권장: Rust
+
 - 바이너리 1~2개로 끝내기: `mini-sync`(CLI), `mini-syncd`(daemon)
 - Wayland 클립보드:
   - MVP는 **wl-clipboard**(`wl-copy`, `wl-paste`) 호출로 구현 (가장 단순/범용)
   - 추후 네이티브 Wayland 프로토콜 직접 연동은 옵션
 
 ### 2.2 Android — 권장: Kotlin + Jetpack Compose
+
 - 백그라운드 제약 대응:
   - 클립보드 자동 감지는 “항상”이 아니라
     - **앱 포그라운드 시 즉시**
@@ -57,6 +60,7 @@ mini-sync는 **Standalone WM/Compositor(Sway/Hyprland 등) 사용자**를 위한
 ## 3) 아키텍처(간단/견고)
 
 ### 3.1 구성요소
+
 - Desktop
   - `mini-syncd`: 백그라운드 데몬(네트워크, 페어링, 수신, 클립보드 watch)
   - `mini-sync`: CLI(페어링 시작/파일 전송/상태 확인)
@@ -66,14 +70,15 @@ mini-sync는 **Standalone WM/Compositor(Sway/Hyprland 등) 사용자**를 위한
   - 메시지 스키마(가능하면 `proto/`에 JSON schema 또는 protobuf 정의)
 
 ### 3.2 네트워크 플로우(권장)
+
 - **Discovery**: mDNS(zeroconf)
   - 서비스: `_minisync._tcp`
   - TXT: `device_id`, `device_name`, `capabilities`(clipboard,file)
 - **Control Channel**: TCP 1개(고정 포트 or 발견된 포트)
 - **File Transfer**: “오퍼(offer) + pull” 방식 권장
   - 작은 파일은 바로 전송해도 되지만, 기본은:
-    1) Sender가 `FILE_OFFER`(메타데이터 + 단기 토큰) 전송
-    2) Receiver가 승인 후 `GET /file/<id>?token=...`로 다운로드
+    1. Sender가 `FILE_OFFER`(메타데이터 + 단기 토큰) 전송
+    2. Receiver가 승인 후 `GET /file/<id>?token=...`로 다운로드
   - 장점: 큰 파일 전송이 단순해지고, 재시도/중단 복구가 쉬움
 
 ---
@@ -81,6 +86,7 @@ mini-sync는 **Standalone WM/Compositor(Sway/Hyprland 등) 사용자**를 위한
 ## 4) 보안 설계(최소 요건)
 
 ### 4.1 페어링(권장 UX)
+
 - Desktop에서 `mini-sync pair` 실행 → QR 표시
 - QR 내용:
   - `device_id`, `ip:port`
@@ -89,6 +95,7 @@ mini-sync는 **Standalone WM/Compositor(Sway/Hyprland 등) 사용자**를 위한
   - 사람이 확인할 **6자리 코드**(MITM 방지 보조)
 
 ### 4.2 암호화/인증(권장 구현 1안)
+
 - 장기 키: Ed25519 또는 X25519 (라이브러리 표준 선택)
 - 세션: Noise/libsodium box 계열(검증된 구현 사용)
 - 메시지 프레이밍:
@@ -104,12 +111,14 @@ mini-sync는 **Standalone WM/Compositor(Sway/Hyprland 등) 사용자**를 위한
 ## 5) 메시지 타입(초기 최소)
 
 공통 필드:
+
 - `version`
 - `msg_id`(UUID)
 - `sender_device_id`
 - `timestamp_ms`
 
 ### 5.1 Control
+
 - `HELLO` (capabilities, device_name)
 - `PAIR_REQUEST` (token, code, pubkey)
 - `PAIR_ACCEPT` (code_confirm, pubkey)
@@ -117,6 +126,7 @@ mini-sync는 **Standalone WM/Compositor(Sway/Hyprland 등) 사용자**를 위한
 - `PING` / `PONG`
 
 ### 5.2 Clipboard
+
 - `CLIP_PUSH`
   - `content_type`: `text/plain` (MVP 고정)
   - `text`: string
@@ -124,6 +134,7 @@ mini-sync는 **Standalone WM/Compositor(Sway/Hyprland 등) 사용자**를 위한
 - `CLIP_ACK` (optional)
 
 ### 5.3 File
+
 - `FILE_OFFER`
   - `offer_id`: UUID
   - `items`: [{name, size, sha256}]
@@ -136,6 +147,7 @@ mini-sync는 **Standalone WM/Compositor(Sway/Hyprland 등) 사용자**를 위한
 ## 6) Desktop UX 스펙
 
 ### 6.1 CLI 명령(최소)
+
 - `mini-sync status`
 - `mini-sync devices`
 - `mini-sync pair` (QR 출력: ANSI/터미널 또는 이미지 파일 생성)
@@ -146,6 +158,7 @@ mini-sync는 **Standalone WM/Compositor(Sway/Hyprland 등) 사용자**를 위한
 - `mini-sync config` (경로 출력 정도만)
 
 ### 6.2 데몬
+
 - user systemd 서비스 권장:
   - `~/.config/systemd/user/mini-sync.service`
   - `ExecStart=/usr/bin/mini-syncd`
@@ -158,6 +171,7 @@ mini-sync는 **Standalone WM/Compositor(Sway/Hyprland 등) 사용자**를 위한
     - `paired_devices = [...]`
 
 ### 6.3 파일관리자 연동(문서 제공)
+
 - Nautilus/Thunar는 확장보다 **커스텀 액션 레시피**를 README에 제공
 - 예: `mini-sync send <device> %F`
 
@@ -199,23 +213,28 @@ mini-sync는 **Standalone WM/Compositor(Sway/Hyprland 등) 사용자**를 위한
 ## 10) 마일스톤 / 구현 순서(중요)
 
 ### M0: Skeleton
+
 - repo 구조 생성(`desktop/`, `android/`, `proto/`)
 - Desktop: `mini-sync status` / `mini-syncd --version`
 
 ### M1: Discovery + Pairing
+
 - mDNS 광고/탐색
 - QR 기반 페어링
 - paired device 저장/삭제
 
 ### M2: Clipboard (text)
+
 - Desktop: `clipboard push`, `clipboard watch`(wl-paste 기반)
 - Android: 수동 전송 + 포그라운드 시 감지
 
 ### M3: File Transfer
+
 - PC→Android: offer + pull
 - Android→PC: Share Intent → 업로드(또는 offer + pull)
 
 ### M4: Hardening
+
 - 재연결 안정화, 타임아웃/재시도
 - 충돌 정책 고정, 로그/진단 개선
 
@@ -242,6 +261,3 @@ mini-sync는 **Standalone WM/Compositor(Sway/Hyprland 등) 사용자**를 위한
   - “항상 자동”은 후순위.
 - 코드 생성 도구는 적극 사용하되,
   - 암호/인증/키관리 로직은 사람이 설계 의도를 검토하고 진행할 것.
-
-끝.
-```
