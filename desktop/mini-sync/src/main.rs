@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use mini_sync_common::{
     config::{Config, PairedDevice},
+    identity::Identity,
     paths,
 };
 use std::path::{Path, PathBuf};
@@ -168,6 +169,9 @@ fn remove_device(device_id: &str, config_path: &Path) -> Result<(), String> {
 fn print_status() {
     let config_path = paths::config_file();
     println!("config_path: {}", config_path.display());
+    let identity_path = paths::identity_file();
+    println!("identity_path: {}", identity_path.display());
+    print_identity(identity_path, true);
 
     match Config::load_optional(&config_path) {
         Ok(Some(config)) => {
@@ -219,6 +223,7 @@ fn print_config() {
     println!("config_path: {}", config_path.display());
     println!("state_dir: {}", paths::state_dir().display());
     println!("log_dir: {}", paths::log_dir().display());
+    println!("identity_path: {}", paths::identity_file().display());
 
     match Config::load_optional(&config_path) {
         Ok(Some(config)) => {
@@ -249,5 +254,33 @@ fn load_config_or_default(config_path: &Path) -> Result<Config, String> {
         Ok(Some(config)) => Ok(config),
         Ok(None) => Ok(Config::default()),
         Err(err) => Err(format!("config_load_failed: {}", err)),
+    }
+}
+
+fn print_identity(identity_path: PathBuf, create_if_missing: bool) {
+    if create_if_missing {
+        match Identity::load_or_generate(&identity_path) {
+            Ok(identity) => {
+                println!("device_id: {}", identity.device_id);
+                println!("public_key: {}", identity.public_key);
+            }
+            Err(err) => {
+                eprintln!("identity_error: {}", err);
+            }
+        }
+        return;
+    }
+
+    match Identity::load_optional(&identity_path) {
+        Ok(Some(identity)) => {
+            println!("device_id: {}", identity.device_id);
+            println!("public_key: {}", identity.public_key);
+        }
+        Ok(None) => {
+            println!("identity_status: missing");
+        }
+        Err(err) => {
+            eprintln!("identity_error: {}", err);
+        }
     }
 }

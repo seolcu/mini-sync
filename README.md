@@ -19,6 +19,7 @@ Status: skeleton (M0). CLI/daemon stubs only.
 - `cargo run -p mini-sync -- --help`
 - `cargo run -p mini-syncd -- --version`
 - Manual device entry (stub): `mini-sync pair --device-id <id> --pubkey <key> [--name <name>]`
+- Generate/load local identity: `mini-sync status` (writes `~/.local/state/mini-sync/identity.toml`)
 
 ## Notes
 - Wayland clipboard via `wl-clipboard` is planned
