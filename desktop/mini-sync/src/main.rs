@@ -1,23 +1,30 @@
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::{Parser, Subcommand};
 use mini_sync_common::{
+    clipboard::ClipboardState,
     config::{Config, PairedDevice},
     discovery::DiscoveryState,
     identity::Identity,
     pairing::PairingSession,
     paths,
 };
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use qrcode::QrCode;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use snow::Builder;
 use std::collections::HashSet;
 use std::env;
+use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use walkdir::WalkDir;
+use zip::write::FileOptions;
+use zip::CompressionMethod;
 
 #[derive(Parser)]
 #[command(name = "mini-sync", version, about = "Minimal PC <-> Android sync CLI")]
@@ -139,6 +146,18 @@ enum Command {
         device: String,
         #[arg(required = true)]
         paths: Vec<PathBuf>,
+        #[arg(long)]
+        addr: Option<String>,
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        secure: bool,
+        #[arg(long)]
+        peer_dh_pubkey: Option<String>,
+        #[arg(long)]
+        timeout_secs: Option<u64>,
+        #[arg(long)]
+        wait_secs: Option<u64>,
     },
     Clipboard {
         #[command(subcommand)]
@@ -164,7 +183,21 @@ enum ClipboardCommand {
         #[arg(long)]
         timeout_secs: Option<u64>,
     },
-    Watch { device: String },
+    Watch {
+        device: String,
+        #[arg(long)]
+        addr: Option<String>,
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        secure: bool,
+        #[arg(long)]
+        peer_dh_pubkey: Option<String>,
+        #[arg(long, default_value_t = 500)]
+        interval_ms: u64,
+        #[arg(long)]
+        timeout_secs: Option<u64>,
+    },
 }
 
 fn main() {
@@ -307,12 +340,29 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Send { device, paths } => {
-            println!(
-                "send to {}: {} item(s) (stub)",
+        Command::Send {
+            device,
+            paths,
+            addr,
+            port,
+            secure,
+            peer_dh_pubkey,
+            timeout_secs,
+            wait_secs,
+        } => {
+            if let Err(err) = send_file_offer(
                 device,
-                paths.len()
-            );
+                paths,
+                addr,
+                port,
+                secure,
+                peer_dh_pubkey,
+                timeout_secs,
+                wait_secs,
+            ) {
+                eprintln!("send_error: {}", err);
+                std::process::exit(1);
+            }
         }
         Command::Clipboard { command } => match command {
             ClipboardCommand::Push {
@@ -337,8 +387,27 @@ fn main() {
                     std::process::exit(1);
                 }
             }
-            ClipboardCommand::Watch { device } => {
-                println!("clipboard watch for {}: not implemented yet", device);
+            ClipboardCommand::Watch {
+                device,
+                addr,
+                port,
+                secure,
+                peer_dh_pubkey,
+                interval_ms,
+                timeout_secs,
+            } => {
+                if let Err(err) = watch_clipboard(
+                    device,
+                    addr,
+                    port,
+                    secure,
+                    peer_dh_pubkey,
+                    interval_ms,
+                    timeout_secs,
+                ) {
+                    eprintln!("clipboard_watch_error: {}", err);
+                    std::process::exit(1);
+                }
             }
         },
         Command::Config => print_config(),
@@ -590,6 +659,7 @@ fn print_config() {
     println!("identity_path: {}", paths::identity_file().display());
     println!("pairing_path: {}", paths::pairing_file().display());
     println!("discovery_path: {}", paths::discovery_file().display());
+    println!("clipboard_state_path: {}", paths::clipboard_state_file().display());
 
     match Config::load_optional(&config_path) {
         Ok(Some(config)) => {
@@ -808,7 +878,7 @@ struct ClipAckResponse {
     clip_id: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct SecureInit {
     version: u8,
     msg_id: String,
@@ -820,6 +890,16 @@ struct SecureInit {
 
 #[derive(Deserialize)]
 struct SecureAccept {
+    msg_type: String,
+    payload: String,
+}
+
+#[derive(Serialize)]
+struct SecureAcceptMessage {
+    version: u8,
+    msg_id: String,
+    sender_device_id: String,
+    timestamp_ms: u64,
     msg_type: String,
     payload: String,
 }
@@ -850,6 +930,45 @@ struct ClipPushMessage {
     content_type: String,
     text: String,
     clip_id: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct FileItem {
+    name: String,
+    size: u64,
+    sha256: String,
+}
+
+#[derive(Serialize)]
+struct FileOfferMessage {
+    version: u8,
+    msg_id: String,
+    sender_device_id: String,
+    timestamp_ms: u64,
+    msg_type: String,
+    offer_id: String,
+    items: Vec<FileItem>,
+    endpoint: String,
+    token: String,
+}
+
+#[derive(Deserialize)]
+struct FileAcceptResponse {
+    offer_id: String,
+}
+
+#[derive(Deserialize)]
+struct FileRejectResponse {
+    offer_id: String,
+    reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FileGetMessage {
+    sender_device_id: String,
+    msg_type: String,
+    offer_id: String,
+    token: String,
 }
 
 fn send_pair_request(
@@ -1079,6 +1198,359 @@ fn send_daemon_status(
     Ok(())
 }
 
+struct PreparedOffer {
+    items: Vec<FileItem>,
+    path: PathBuf,
+    cleanup_paths: Vec<PathBuf>,
+}
+
+fn send_file_offer(
+    device: String,
+    input_paths: Vec<PathBuf>,
+    addr: Option<String>,
+    port_override: Option<u16>,
+    secure_flag: bool,
+    peer_dh_pubkey: Option<String>,
+    timeout_secs: Option<u64>,
+    wait_secs: Option<u64>,
+) -> Result<(), String> {
+    if input_paths.is_empty() {
+        return Err("missing file path".to_string());
+    }
+    let config = load_config_or_default(&paths::config_file())?;
+    let identity = Identity::load_or_generate(&paths::identity_file())
+        .map_err(|err| format!("identity_load_failed: {}", err))?;
+    let sender_device_id = identity.device_id.clone();
+
+    let (addr, port) = resolve_target_for_device(&device, addr, port_override, &config)?;
+    let target = format!("{}:{}", addr, port);
+    let local_ip = resolve_local_ip(&target)?;
+    let offer_id = uuid::Uuid::new_v4().to_string();
+    let prepared = prepare_file_offer(&input_paths, &offer_id)?;
+    let token = random_token();
+
+    let listener = TcpListener::bind(("0.0.0.0", 0))
+        .map_err(|err| format!("file_listen_failed: {}", err))?;
+    let file_port = listener
+        .local_addr()
+        .map_err(|err| format!("file_listen_failed: {}", err))?
+        .port();
+    let host = match local_ip {
+        IpAddr::V4(addr) => addr.to_string(),
+        IpAddr::V6(addr) => format!("[{}]", addr),
+    };
+    let endpoint = format!("tcp://{}:{}", host, file_port);
+
+    let message = FileOfferMessage {
+        version: 1,
+        msg_id: uuid::Uuid::new_v4().to_string(),
+        sender_device_id: sender_device_id.clone(),
+        timestamp_ms: now_ms(),
+        msg_type: "FILE_OFFER".to_string(),
+        offer_id: offer_id.clone(),
+        items: prepared.items.clone(),
+        endpoint,
+        token: token.clone(),
+    };
+    let payload =
+        serde_json::to_string(&message).map_err(|err| format!("json_error: {}", err))?;
+    let context =
+        resolve_secure_context(&config, Some(device.clone()), peer_dh_pubkey, secure_flag)?;
+    let response = send_control_request(
+        &target,
+        &payload,
+        timeout_secs.unwrap_or(REQUEST_TIMEOUT_SECS),
+        &identity,
+        &sender_device_id,
+        context.clone(),
+    )?;
+    if !is_file_offer_accepted(&response)? {
+        print_control_response(&response);
+        cleanup_offer_files(&prepared);
+        return Err("file_offer_rejected".to_string());
+    }
+
+    let peer_dh_pubkey = context
+        .peer_dh_pubkey
+        .ok_or_else(|| "missing peer dh pubkey for file transfer".to_string())?;
+    let wait_secs = wait_secs.unwrap_or(FILE_OFFER_WAIT_SECS);
+    let result = serve_file_offer(
+        listener,
+        &device,
+        &offer_id,
+        &token,
+        &prepared.path,
+        &peer_dh_pubkey,
+        &identity,
+        wait_secs,
+    );
+    cleanup_offer_files(&prepared);
+    result
+}
+
+fn prepare_file_offer(paths: &[PathBuf], offer_id: &str) -> Result<PreparedOffer, String> {
+    let single = paths.len() == 1 && paths[0].is_file();
+    if single {
+        let item = build_file_item(&paths[0])?;
+        return Ok(PreparedOffer {
+            items: vec![item],
+            path: paths[0].clone(),
+            cleanup_paths: Vec::new(),
+        });
+    }
+
+    let zip_path = create_zip_bundle(paths, offer_id)?;
+    let item = build_file_item(&zip_path)?;
+    Ok(PreparedOffer {
+        items: vec![item],
+        path: zip_path.clone(),
+        cleanup_paths: vec![zip_path],
+    })
+}
+
+fn create_zip_bundle(paths: &[PathBuf], offer_id: &str) -> Result<PathBuf, String> {
+    let mut has_entries = false;
+    for path in paths {
+        if !path.exists() {
+            return Err(format!("path_not_found: {}", path.display()));
+        }
+        has_entries = true;
+    }
+    if !has_entries {
+        return Err("no_paths_to_zip".to_string());
+    }
+
+    let zip_name = format!("mini-sync-{}.zip", offer_id);
+    let zip_path = std::env::temp_dir().join(zip_name);
+    let file = File::create(&zip_path).map_err(|err| format!("zip_create_failed: {}", err))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = FileOptions::default().compression_method(CompressionMethod::Deflated);
+
+    for root in paths {
+        if root.is_dir() {
+            let root_name = root
+                .file_name()
+                .map(|value| value.to_string_lossy().to_string())
+                .unwrap_or_else(|| "root".to_string());
+            for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let path = entry.path();
+                let rel = path.strip_prefix(root).map_err(|_| "zip_path_error")?;
+                let name = Path::new(&root_name).join(rel);
+                let name = name.to_string_lossy().replace('\\', "/");
+                zip.start_file(name, options)
+                    .map_err(|err| format!("zip_start_failed: {}", err))?;
+                let mut src =
+                    File::open(path).map_err(|err| format!("zip_read_failed: {}", err))?;
+                std::io::copy(&mut src, &mut zip)
+                    .map_err(|err| format!("zip_write_failed: {}", err))?;
+            }
+        } else {
+            let name = root
+                .file_name()
+                .ok_or_else(|| "zip_name_failed".to_string())?
+                .to_string_lossy()
+                .replace('\\', "/");
+            zip.start_file(name, options)
+                .map_err(|err| format!("zip_start_failed: {}", err))?;
+            let mut src = File::open(root).map_err(|err| format!("zip_read_failed: {}", err))?;
+            std::io::copy(&mut src, &mut zip)
+                .map_err(|err| format!("zip_write_failed: {}", err))?;
+        }
+    }
+
+    zip.finish()
+        .map_err(|err| format!("zip_finish_failed: {}", err))?;
+    Ok(zip_path)
+}
+
+fn build_file_item(path: &Path) -> Result<FileItem, String> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| "file_name_missing".to_string())?
+        .to_string_lossy()
+        .to_string();
+    let metadata = fs::metadata(path).map_err(|err| format!("file_stat_failed: {}", err))?;
+    let size = metadata.len();
+    let sha256 = hash_file(path)?;
+    Ok(FileItem { name, size, sha256 })
+}
+
+fn hash_file(path: &Path) -> Result<String, String> {
+    let mut file = File::open(path).map_err(|err| format!("file_open_failed: {}", err))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let read = file.read(&mut buf).map_err(|err| format!("file_read_failed: {}", err))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn resolve_local_ip(target: &str) -> Result<IpAddr, String> {
+    let mut addrs = target
+        .to_socket_addrs()
+        .map_err(|err| format!("resolve_failed: {}", err))?;
+    let remote = addrs
+        .next()
+        .ok_or_else(|| "resolve_failed: no address".to_string())?;
+    let socket =
+        UdpSocket::bind("0.0.0.0:0").map_err(|err| format!("udp_bind_failed: {}", err))?;
+    socket
+        .connect(remote)
+        .map_err(|err| format!("udp_connect_failed: {}", err))?;
+    let local = socket
+        .local_addr()
+        .map_err(|err| format!("udp_addr_failed: {}", err))?;
+    Ok(local.ip())
+}
+
+fn is_file_offer_accepted(response: &str) -> Result<bool, String> {
+    let base: ResponseBase =
+        serde_json::from_str(response).map_err(|err| format!("json_error: {}", err))?;
+    match base.msg_type.as_str() {
+        "FILE_ACCEPT" => Ok(true),
+        "FILE_REJECT" => Ok(false),
+        _ => Err("file_offer_invalid_response".to_string()),
+    }
+}
+
+fn cleanup_offer_files(prepared: &PreparedOffer) {
+    for path in &prepared.cleanup_paths {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn serve_file_offer(
+    listener: TcpListener,
+    expected_device_id: &str,
+    offer_id: &str,
+    token: &str,
+    file_path: &Path,
+    peer_dh_pubkey: &str,
+    identity: &Identity,
+    wait_secs: u64,
+) -> Result<(), String> {
+    listener
+        .set_nonblocking(true)
+        .map_err(|err| format!("file_listen_failed: {}", err))?;
+    let deadline = Instant::now() + Duration::from_secs(wait_secs);
+    loop {
+        match listener.accept() {
+            Ok((mut stream, _addr)) => {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(FILE_TRANSFER_TIMEOUT_SECS)))
+                    .map_err(|err| format!("file_timeout_failed: {}", err))?;
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(FILE_TRANSFER_TIMEOUT_SECS)))
+                    .map_err(|err| format!("file_timeout_failed: {}", err))?;
+
+                let raw = read_frame(&mut stream)?;
+                let raw = String::from_utf8(raw).map_err(|err| format!("utf8_error: {}", err))?;
+                let init: SecureInit =
+                    serde_json::from_str(&raw).map_err(|_| "secure_init_invalid".to_string())?;
+                if init.msg_type != "SECURE_INIT" {
+                    return Err("secure_init_invalid".to_string());
+                }
+                if init.sender_device_id != expected_device_id {
+                    return Err("secure_init_device_mismatch".to_string());
+                }
+
+                let dh_secret = identity
+                    .dh_secret_key_bytes()
+                    .map_err(|err| format!("dh_key_error: {}", err))?;
+                let peer_dh_pubkey = decode_key(peer_dh_pubkey, "peer dh pubkey")?;
+                let params: snow::params::NoiseParams = NOISE_PARAMS
+                    .parse()
+                    .map_err(|err| format!("noise_params_error: {}", err))?;
+                let builder = Builder::new(params)
+                    .local_private_key(&dh_secret)
+                    .remote_public_key(&peer_dh_pubkey);
+                let mut noise = builder
+                    .build_responder()
+                    .map_err(|err| format!("noise_init_error: {}", err))?;
+
+                let payload = STANDARD
+                    .decode(init.payload)
+                    .map_err(|err| format!("b64_error: {}", err))?;
+                let mut handshake_in = vec![0u8; MAX_FRAME_SIZE];
+                noise
+                    .read_message(&payload, &mut handshake_in)
+                    .map_err(|err| format!("noise_read_failed: {}", err))?;
+
+                let mut handshake_out = vec![0u8; MAX_FRAME_SIZE];
+                let len = noise
+                    .write_message(&[], &mut handshake_out)
+                    .map_err(|err| format!("noise_write_failed: {}", err))?;
+                let accept = SecureAcceptMessage {
+                    version: 1,
+                    msg_id: uuid::Uuid::new_v4().to_string(),
+                    sender_device_id: identity.device_id.clone(),
+                    timestamp_ms: now_ms(),
+                    msg_type: "SECURE_ACCEPT".to_string(),
+                    payload: STANDARD.encode(&handshake_out[..len]),
+                };
+                let accept_json =
+                    serde_json::to_string(&accept).map_err(|err| format!("json_error: {}", err))?;
+                write_frame(&mut stream, accept_json.as_bytes())?;
+
+                let mut transport = noise
+                    .into_transport_mode()
+                    .map_err(|err| format!("noise_transport_failed: {}", err))?;
+
+                let request_frame = read_frame(&mut stream)?;
+                let mut plain = vec![0u8; request_frame.len() + 64];
+                let len = transport
+                    .read_message(&request_frame, &mut plain)
+                    .map_err(|err| format!("noise_decrypt_failed: {}", err))?;
+                let request =
+                    String::from_utf8(plain[..len].to_vec()).map_err(|err| format!("utf8_error: {}", err))?;
+                let get: FileGetMessage =
+                    serde_json::from_str(&request).map_err(|_| "file_get_invalid".to_string())?;
+                if get.msg_type != "FILE_GET" {
+                    return Err("file_get_invalid".to_string());
+                }
+                if get.offer_id != offer_id || get.token != token {
+                    return Err("file_get_invalid_token".to_string());
+                }
+                if get.sender_device_id != expected_device_id {
+                    return Err("file_get_device_mismatch".to_string());
+                }
+
+                let mut file =
+                    File::open(file_path).map_err(|err| format!("file_open_failed: {}", err))?;
+                let mut buf = vec![0u8; FILE_CHUNK_SIZE];
+                loop {
+                    let read = file
+                        .read(&mut buf)
+                        .map_err(|err| format!("file_read_failed: {}", err))?;
+                    if read == 0 {
+                        break;
+                    }
+                    let mut cipher = vec![0u8; read + 64];
+                    let len = transport
+                        .write_message(&buf[..read], &mut cipher)
+                        .map_err(|err| format!("noise_encrypt_failed: {}", err))?;
+                    write_frame(&mut stream, &cipher[..len])?;
+                }
+                return Ok(());
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() > deadline {
+                    return Err("file_download_timeout".to_string());
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+            Err(err) => return Err(format!("file_accept_failed: {}", err)),
+        }
+    }
+}
+
 fn send_clipboard_push(
     device: String,
     addr: Option<String>,
@@ -1170,6 +1642,99 @@ fn read_clipboard_text() -> Result<String, String> {
     Ok(text)
 }
 
+fn watch_clipboard(
+    device: String,
+    addr: Option<String>,
+    port_override: Option<u16>,
+    secure_flag: bool,
+    peer_dh_pubkey: Option<String>,
+    interval_ms: u64,
+    timeout_secs: Option<u64>,
+) -> Result<(), String> {
+    let config = load_config_or_default(&paths::config_file())?;
+    let identity = Identity::load_or_generate(&paths::identity_file())
+        .map_err(|err| format!("identity_load_failed: {}", err))?;
+    let sender_device_id = identity.device_id.clone();
+    let (addr, port) = resolve_target_for_device(&device, addr, port_override, &config)?;
+    let target = format!("{}:{}", addr, port);
+    let context = resolve_secure_context(&config, Some(device), peer_dh_pubkey, secure_flag)?;
+    let timeout = timeout_secs.unwrap_or(REQUEST_TIMEOUT_SECS);
+
+    let mut last_text = String::new();
+    loop {
+        let text = match read_clipboard_text() {
+            Ok(text) => text,
+            Err(err) => {
+                eprintln!("clipboard_read_error: {}", err);
+                thread::sleep(Duration::from_millis(interval_ms));
+                continue;
+            }
+        };
+        if text == last_text {
+            thread::sleep(Duration::from_millis(interval_ms));
+            continue;
+        }
+        if should_suppress_clipboard(&text, &sender_device_id)? {
+            last_text = text;
+            thread::sleep(Duration::from_millis(interval_ms));
+            continue;
+        }
+
+        let message = ClipPushMessage {
+            version: 1,
+            msg_id: uuid::Uuid::new_v4().to_string(),
+            sender_device_id: sender_device_id.clone(),
+            timestamp_ms: now_ms(),
+            msg_type: "CLIP_PUSH".to_string(),
+            content_type: "text/plain".to_string(),
+            text: text.clone(),
+            clip_id: uuid::Uuid::new_v4().to_string(),
+        };
+        let payload =
+            serde_json::to_string(&message).map_err(|err| format!("json_error: {}", err))?;
+        match send_control_request(
+            &target,
+            &payload,
+            timeout,
+            &identity,
+            &sender_device_id,
+            context.clone(),
+        ) {
+            Ok(_) => {
+                last_text = text;
+            }
+            Err(err) => {
+                eprintln!("clipboard_push_error: {}", err);
+            }
+        }
+        thread::sleep(Duration::from_millis(interval_ms));
+    }
+}
+
+fn should_suppress_clipboard(text: &str, local_device_id: &str) -> Result<bool, String> {
+    let state = ClipboardState::load_optional(&paths::clipboard_state_file())
+        .map_err(|err| format!("clipboard_state_load_failed: {}", err))?;
+    let Some(state) = state else {
+        return Ok(false);
+    };
+    if state.sender_device_id == local_device_id {
+        return Ok(false);
+    }
+    let now = now_ms();
+    if now.saturating_sub(state.timestamp_ms) > CLIPBOARD_ECHO_WINDOW_MS {
+        return Ok(false);
+    }
+    let text_hash = hash_text(text);
+    Ok(text_hash == state.text_hash)
+}
+
+fn hash_text(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+#[derive(Clone)]
 struct SecureContext {
     secure: bool,
     peer_dh_pubkey: Option<String>,
@@ -1431,6 +1996,24 @@ fn print_control_response(response: &str) {
                 println!("clip_ack");
             }
         }
+        Ok(parsed) if parsed.msg_type == "FILE_ACCEPT" => {
+            if let Ok(accept) = serde_json::from_str::<FileAcceptResponse>(response) {
+                println!("file_accept: {}", accept.offer_id);
+            } else {
+                println!("file_accept");
+            }
+        }
+        Ok(parsed) if parsed.msg_type == "FILE_REJECT" => {
+            if let Ok(reject) = serde_json::from_str::<FileRejectResponse>(response) {
+                if let Some(reason) = reject.reason {
+                    println!("file_reject: {} {}", reject.offer_id, reason);
+                } else {
+                    println!("file_reject: {}", reject.offer_id);
+                }
+            } else {
+                println!("file_reject");
+            }
+        }
         Ok(parsed) if parsed.msg_type == "PAIR_REJECT" => {
             if let Some(reason) = parsed.reason {
                 println!("reject: {}", reason);
@@ -1448,6 +2031,10 @@ fn default_capabilities() -> Vec<String> {
 
 const REQUEST_TIMEOUT_SECS: u64 = 10;
 const DISCOVERY_TTL_MS: u64 = 300_000;
+const CLIPBOARD_ECHO_WINDOW_MS: u64 = 3_000;
+const FILE_OFFER_WAIT_SECS: u64 = 300;
+const FILE_TRANSFER_TIMEOUT_SECS: u64 = 120;
+const FILE_CHUNK_SIZE: usize = 64 * 1024;
 const MAX_FRAME_SIZE: usize = 1_048_576;
 const NOISE_PARAMS: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 

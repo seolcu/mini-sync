@@ -18,6 +18,7 @@
     { "$ref": "#/$defs/ClipPush" },
     { "$ref": "#/$defs/ClipAck" },
     { "$ref": "#/$defs/FileOffer" },
+    { "$ref": "#/$defs/FileGet" },
     { "$ref": "#/$defs/FileAccept" },
     { "$ref": "#/$defs/FileReject" },
     { "$ref": "#/$defs/FileDone" },
@@ -308,6 +309,21 @@
             { "required": ["download_url"] },
             { "required": ["endpoint", "token"] }
           ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "FileGet": {
+      "allOf": [
+        { "$ref": "#/$defs/Base" },
+        {
+          "type": "object",
+          "properties": {
+            "msg_type": { "const": "FILE_GET" },
+            "offer_id": { "type": "string", "format": "uuid" },
+            "token": { "type": "string" }
+          },
+          "required": ["offer_id", "token"],
           "additionalProperties": false
         }
       ]

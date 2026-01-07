@@ -8,7 +8,7 @@ Goals:
 - Minimal dependencies, CLI + simple UI
 - No KDE/Qt/KF stack
 
-Status: early dev; control channel, discovery cache, and clipboard push are in place.
+Status: early dev; control channel, clipboard push/watch, and file offers are in place.
 
 ## Repository layout
 - desktop/ - Rust CLI and daemon
@@ -27,6 +27,8 @@ Status: early dev; control channel, discovery cache, and clipboard push are in p
 - Control channel hello (paired only): `mini-sync hello --addr <ip> --port <port>`
 - Control channel status (daemon IPC): `mini-sync daemon-status --addr <ip> --port <port> [--include-discovery]`
 - Clipboard push (paired only): `mini-sync clipboard push <device> --addr <ip> --port <port>`
+- Clipboard watch (paired only): `mini-sync clipboard watch <device> --addr <ip> --port <port>`
+- File send (paired only): `mini-sync send <device> <path...> --addr <ip> --port <port>`
 - Add `--secure --device <id>` to use Noise on control commands (requires dh keys)
 - mDNS advertise/browse (daemon): `mini-syncd` (prints discovered services)
 - Pairing session is stored at `~/.local/state/mini-sync/pairing.toml` (use `--no-store` to skip)
@@ -40,4 +42,6 @@ Status: early dev; control channel, discovery cache, and clipboard push are in p
 
 ## Notes
 - Clipboard push uses `wl-paste` (client) and `wl-copy` (daemon); install `wl-clipboard`.
+- File offers include a Noise-protected `tcp://` endpoint and short-lived token (pull-based download).
+- Received files are written to `download_dir` (default `~/Downloads/mini-sync`); multi-path sends are zipped.
 - Pairing + encrypted transport planned (see `AGENTS.md`)
