@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use mini_sync_common::{
     config::{Config, PairedDevice},
+    discovery::DiscoveryState,
     identity::Identity,
     pairing::PairingSession,
     paths,
@@ -12,6 +13,7 @@ use std::env;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
@@ -25,7 +27,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Status,
-    Devices,
+    Devices {
+        #[arg(long)]
+        available: bool,
+        #[arg(long)]
+        all: bool,
+    },
     Pair {
         #[arg(long)]
         device_id: Option<String>,
@@ -116,7 +123,7 @@ fn main() {
 
     match cli.command {
         Command::Status => print_status(),
-        Command::Devices => print_devices(),
+        Command::Devices { available, all } => print_devices(available, all),
         Command::Pair {
             device_id,
             pubkey,
@@ -387,6 +394,8 @@ fn print_status() {
     let pairing_path = paths::pairing_file();
     println!("pairing_path: {}", pairing_path.display());
     print_pairing_status(&pairing_path);
+    let discovery_path = paths::discovery_file();
+    println!("discovery_path: {}", discovery_path.display());
 
     match Config::load_optional(&config_path) {
         Ok(Some(config)) => {
@@ -407,30 +416,53 @@ fn print_status() {
     println!("daemon_status: stub");
 }
 
-fn print_devices() {
+fn print_devices(show_available: bool, show_all: bool) {
     let config_path = paths::config_file();
-    match Config::load_optional(&config_path) {
+    let config = match Config::load_optional(&config_path) {
         Ok(Some(config)) => {
-            if config.paired_devices.is_empty() {
-                println!("paired_devices: none");
-            } else {
-                for device in config.paired_devices {
-                    let name = device.device_name.unwrap_or_else(|| "unknown".to_string());
-                    let last_seen = device
-                        .last_seen_ms
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "-".to_string());
-                    println!("{}\t{}\t{}", device.device_id, name, last_seen);
-                }
-            }
+            config
         }
         Ok(None) => {
-            println!("paired_devices: none");
+            Config::default()
         }
         Err(err) => {
             eprintln!("config_error: {}", err);
+            return;
         }
+    };
+
+    if !show_available && !show_all {
+        print_paired_devices(&config, false);
+        return;
     }
+
+    let paired_ids: HashSet<String> = config
+        .paired_devices
+        .iter()
+        .map(|device| device.device_id.clone())
+        .collect();
+
+    let discovery_path = paths::discovery_file();
+    let discovery = match DiscoveryState::load_optional(&discovery_path) {
+        Ok(Some(mut state)) => {
+            let now = now_ms();
+            state.prune_expired(now, DISCOVERY_TTL_MS);
+            Some(state)
+        }
+        Ok(None) => None,
+        Err(err) => {
+            eprintln!("discovery_error: {}", err);
+            None
+        }
+    };
+
+    if show_all {
+        print_paired_devices(&config, true);
+        print_available_devices(&discovery, &paired_ids);
+        return;
+    }
+
+    print_available_devices(&discovery, &paired_ids);
 }
 
 fn print_config() {
@@ -440,6 +472,7 @@ fn print_config() {
     println!("log_dir: {}", paths::log_dir().display());
     println!("identity_path: {}", paths::identity_file().display());
     println!("pairing_path: {}", paths::pairing_file().display());
+    println!("discovery_path: {}", paths::discovery_file().display());
 
     match Config::load_optional(&config_path) {
         Ok(Some(config)) => {
@@ -470,6 +503,64 @@ fn print_config_summary(config: &Config) {
     println!("download_dir: {}", config.download_dir.display());
     println!("clipboard.watch: {}", config.clipboard.watch);
     println!("paired_devices: {}", config.paired_devices.len());
+}
+
+fn print_paired_devices(config: &Config, include_prefix: bool) {
+    if config.paired_devices.is_empty() {
+        println!("paired_devices: none");
+        return;
+    }
+    for device in &config.paired_devices {
+        let name = device.device_name.clone().unwrap_or_else(|| "unknown".to_string());
+        let last_seen = device
+            .last_seen_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        if include_prefix {
+            println!("paired\t{}\t{}\t{}", device.device_id, name, last_seen);
+        } else {
+            println!("{}\t{}\t{}", device.device_id, name, last_seen);
+        }
+    }
+}
+
+fn print_available_devices(
+    discovery: &Option<DiscoveryState>,
+    paired_ids: &HashSet<String>,
+) {
+    let Some(state) = discovery else {
+        println!("available_devices: none");
+        return;
+    };
+    let mut printed = false;
+    for device in &state.devices {
+        if paired_ids.contains(&device.device_id) {
+            continue;
+        }
+        let name = device
+            .device_name
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        let last_seen = device.last_seen_ms.to_string();
+        let addr = if device.addresses.is_empty() {
+            "-".to_string()
+        } else {
+            device.addresses.join(",")
+        };
+        let caps = if device.capabilities.is_empty() {
+            "-".to_string()
+        } else {
+            device.capabilities.join(",")
+        };
+        println!(
+            "available\t{}\t{}\t{}\t{}\t{}",
+            device.device_id, name, last_seen, addr, caps
+        );
+        printed = true;
+    }
+    if !printed {
+        println!("available_devices: none");
+    }
 }
 
 fn load_config_or_default(config_path: &Path) -> Result<Config, String> {
@@ -726,6 +817,7 @@ fn default_capabilities() -> Vec<String> {
 }
 
 const REQUEST_TIMEOUT_SECS: u64 = 10;
+const DISCOVERY_TTL_MS: u64 = 300_000;
 
 fn print_identity(identity_path: PathBuf, create_if_missing: bool) {
     if create_if_missing {

@@ -28,6 +28,8 @@ Status: skeleton (M0). CLI/daemon stubs only.
 - Pairing session is stored at `~/.local/state/mini-sync/pairing.toml` (use `--no-store` to skip)
 - Daemon listens on `listen_port` for JSON `PAIR_REQUEST` messages and replies with `PAIR_ACCEPT`/`PAIR_REJECT`
 - Pairing requests are newline-delimited JSON (one message per line)
+- Discovered devices are cached in `~/.local/state/mini-sync/discovered.toml` (use `mini-sync devices --available`)
+- `mini-sync devices --all` shows paired + available
 
 ## Notes
 - Wayland clipboard via `wl-clipboard` is planned

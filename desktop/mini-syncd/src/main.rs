@@ -2,6 +2,7 @@ use clap::Parser;
 use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
 use mini_sync_common::{
     config::{Config, PairedDevice},
+    discovery::{DiscoveredDevice, DiscoveryState},
     identity::Identity,
     pairing::PairingSession,
     paths,
@@ -145,8 +146,9 @@ fn main() {
         let identity_clone = identity.clone();
         let device_name_clone = device_name.clone();
         let port = config.listen_port;
+        let discovery_path = paths::discovery_file();
         thread::spawn(move || {
-            if let Err(err) = run_mdns(&identity_clone, &device_name_clone, port) {
+            if let Err(err) = run_mdns(&identity_clone, &device_name_clone, port, discovery_path) {
                 eprintln!("mdns_error: {}", err);
             }
         });
@@ -425,7 +427,12 @@ fn new_msg_id() -> String {
     Uuid::new_v4().to_string()
 }
 
-fn run_mdns(identity: &Identity, device_name: &str, port: u16) -> Result<(), String> {
+fn run_mdns(
+    identity: &Identity,
+    device_name: &str,
+    port: u16,
+    discovery_path: std::path::PathBuf,
+) -> Result<(), String> {
     let mdns = ServiceDaemon::new().map_err(|err| format!("mdns_init_failed: {}", err))?;
     let service_type = "_minisync._tcp.local.";
     let short_id = short_device_id(&identity.device_id);
@@ -451,7 +458,14 @@ fn run_mdns(identity: &Identity, device_name: &str, port: u16) -> Result<(), Str
     loop {
         match receiver.recv() {
             Ok(ServiceEvent::ServiceResolved(info)) => {
-                print_resolved_device(&info, &identity.device_id);
+                if let Some(device) =
+                    build_discovered_device(&info, &identity.device_id, now_ms())
+                {
+                    print_discovered_device(&device);
+                    if let Err(err) = store_discovered_device(&discovery_path, device) {
+                        eprintln!("discovery_store_error: {}", err);
+                    }
+                }
             }
             Ok(ServiceEvent::ServiceRemoved(_ty, fullname)) => {
                 println!("mdns_removed: {}", fullname);
@@ -464,40 +478,79 @@ fn run_mdns(identity: &Identity, device_name: &str, port: u16) -> Result<(), Str
     }
 }
 
-fn print_resolved_device(info: &ResolvedService, local_device_id: &str) {
+fn build_discovered_device(
+    info: &ResolvedService,
+    local_device_id: &str,
+    last_seen_ms: u64,
+) -> Option<DiscoveredDevice> {
     let device_id = info
         .txt_properties
         .get_property_val_str("device_id")
         .unwrap_or("unknown");
     if device_id == local_device_id {
-        return;
+        return None;
     }
     let device_name = info
         .txt_properties
         .get_property_val_str("device_name")
-        .unwrap_or("unknown");
+        .map(|value| value.to_string());
     let capabilities = info
         .txt_properties
         .get_property_val_str("capabilities")
-        .unwrap_or("-");
+        .unwrap_or("");
     let addresses: Vec<String> = info
         .get_addresses()
         .iter()
         .map(|addr| addr.to_ip_addr().to_string())
         .collect();
-    let address_list = if addresses.is_empty() {
+    let capabilities: Vec<String> = capabilities
+        .split(',')
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+        .collect();
+    Some(DiscoveredDevice {
+        device_id: device_id.to_string(),
+        device_name,
+        capabilities,
+        addresses,
+        port: info.get_port(),
+        last_seen_ms,
+    })
+}
+
+fn print_discovered_device(device: &DiscoveredDevice) {
+    let name = device
+        .device_name
+        .as_deref()
+        .unwrap_or("unknown");
+    let caps = if device.capabilities.is_empty() {
         "-".to_string()
     } else {
-        addresses.join(",")
+        device.capabilities.join(",")
+    };
+    let addresses = if device.addresses.is_empty() {
+        "-".to_string()
+    } else {
+        device.addresses.join(",")
     };
     println!(
         "mdns_device: {} {} {} {}:{}",
-        device_id,
-        device_name,
-        capabilities,
-        address_list,
-        info.get_port()
+        device.device_id, name, caps, addresses, device.port
     );
+}
+
+fn store_discovered_device(
+    discovery_path: &Path,
+    device: DiscoveredDevice,
+) -> Result<(), String> {
+    let mut state =
+        DiscoveryState::load_or_default(discovery_path).map_err(|err| err.to_string())?;
+    state.upsert(device);
+    state
+        .save(discovery_path)
+        .map_err(|err| err.to_string())?;
+    Ok(())
 }
 
 fn upsert_paired_device(
