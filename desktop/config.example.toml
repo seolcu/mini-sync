@@ -1,5 +1,12 @@
 listen_port = 9150
 download_dir = "/home/USER/Downloads/mini-sync"
+paired_devices = []
 
 [clipboard]
 watch = false
+
+# [[paired_devices]]
+# device_id = "device-id"
+# device_name = "phone"
+# pubkey = "base64-encoded-pubkey"
+# last_seen_ms = 0

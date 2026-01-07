@@ -1,0 +1,245 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/mini-sync/messages.schema.json",
+  "title": "mini-sync messages",
+  "oneOf": [
+    { "$ref": "#/$defs/Hello" },
+    { "$ref": "#/$defs/PairRequest" },
+    { "$ref": "#/$defs/PairAccept" },
+    { "$ref": "#/$defs/PairReject" },
+    { "$ref": "#/$defs/Ping" },
+    { "$ref": "#/$defs/Pong" },
+    { "$ref": "#/$defs/ClipPush" },
+    { "$ref": "#/$defs/ClipAck" },
+    { "$ref": "#/$defs/FileOffer" },
+    { "$ref": "#/$defs/FileAccept" },
+    { "$ref": "#/$defs/FileReject" },
+    { "$ref": "#/$defs/FileDone" },
+    { "$ref": "#/$defs/FileError" }
+  ],
+  "$defs": {
+    "Base": {
+      "type": "object",
+      "properties": {
+        "version": { "type": "integer", "minimum": 1 },
+        "msg_id": { "type": "string", "format": "uuid" },
+        "sender_device_id": { "type": "string" },
+        "timestamp_ms": { "type": "integer", "minimum": 0 },
+        "msg_type": { "type": "string" }
+      },
+      "required": ["version", "msg_id", "sender_device_id", "timestamp_ms", "msg_type"],
+      "additionalProperties": false
+    },
+    "Hello": {
+      "allOf": [
+        { "$ref": "#/$defs/Base" },
+        {
+          "type": "object",
+          "properties": {
+            "msg_type": { "const": "HELLO" },
+            "device_name": { "type": "string" },
+            "capabilities": {
+              "type": "array",
+              "items": { "type": "string", "enum": ["clipboard", "file"] },
+              "minItems": 1
+            }
+          },
+          "required": ["device_name", "capabilities"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "PairRequest": {
+      "allOf": [
+        { "$ref": "#/$defs/Base" },
+        {
+          "type": "object",
+          "properties": {
+            "msg_type": { "const": "PAIR_REQUEST" },
+            "token": { "type": "string" },
+            "code": { "type": "string", "pattern": "^[0-9]{6}$" },
+            "pubkey": { "type": "string" }
+          },
+          "required": ["token", "code", "pubkey"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "PairAccept": {
+      "allOf": [
+        { "$ref": "#/$defs/Base" },
+        {
+          "type": "object",
+          "properties": {
+            "msg_type": { "const": "PAIR_ACCEPT" },
+            "code_confirm": { "type": "string", "pattern": "^[0-9]{6}$" },
+            "pubkey": { "type": "string" }
+          },
+          "required": ["code_confirm", "pubkey"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "PairReject": {
+      "allOf": [
+        { "$ref": "#/$defs/Base" },
+        {
+          "type": "object",
+          "properties": {
+            "msg_type": { "const": "PAIR_REJECT" },
+            "reason": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Ping": {
+      "allOf": [
+        { "$ref": "#/$defs/Base" },
+        {
+          "type": "object",
+          "properties": {
+            "msg_type": { "const": "PING" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Pong": {
+      "allOf": [
+        { "$ref": "#/$defs/Base" },
+        {
+          "type": "object",
+          "properties": {
+            "msg_type": { "const": "PONG" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ClipPush": {
+      "allOf": [
+        { "$ref": "#/$defs/Base" },
+        {
+          "type": "object",
+          "properties": {
+            "msg_type": { "const": "CLIP_PUSH" },
+            "content_type": { "const": "text/plain" },
+            "text": { "type": "string" },
+            "clip_id": { "type": "string", "format": "uuid" }
+          },
+          "required": ["content_type", "text", "clip_id"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ClipAck": {
+      "allOf": [
+        { "$ref": "#/$defs/Base" },
+        {
+          "type": "object",
+          "properties": {
+            "msg_type": { "const": "CLIP_ACK" },
+            "clip_id": { "type": "string", "format": "uuid" }
+          },
+          "required": ["clip_id"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "FileItem": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "size": { "type": "integer", "minimum": 0 },
+        "sha256": { "type": "string", "pattern": "^[A-Fa-f0-9]{64}$" }
+      },
+      "required": ["name", "size", "sha256"],
+      "additionalProperties": false
+    },
+    "FileOffer": {
+      "allOf": [
+        { "$ref": "#/$defs/Base" },
+        {
+          "type": "object",
+          "properties": {
+            "msg_type": { "const": "FILE_OFFER" },
+            "offer_id": { "type": "string", "format": "uuid" },
+            "items": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/FileItem" },
+              "minItems": 1
+            },
+            "download_url": { "type": "string" },
+            "endpoint": { "type": "string" },
+            "token": { "type": "string" }
+          },
+          "required": ["offer_id", "items"],
+          "oneOf": [
+            { "required": ["download_url"] },
+            { "required": ["endpoint", "token"] }
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "FileAccept": {
+      "allOf": [
+        { "$ref": "#/$defs/Base" },
+        {
+          "type": "object",
+          "properties": {
+            "msg_type": { "const": "FILE_ACCEPT" },
+            "offer_id": { "type": "string", "format": "uuid" }
+          },
+          "required": ["offer_id"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "FileReject": {
+      "allOf": [
+        { "$ref": "#/$defs/Base" },
+        {
+          "type": "object",
+          "properties": {
+            "msg_type": { "const": "FILE_REJECT" },
+            "offer_id": { "type": "string", "format": "uuid" },
+            "reason": { "type": "string" }
+          },
+          "required": ["offer_id"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "FileDone": {
+      "allOf": [
+        { "$ref": "#/$defs/Base" },
+        {
+          "type": "object",
+          "properties": {
+            "msg_type": { "const": "FILE_DONE" },
+            "offer_id": { "type": "string", "format": "uuid" }
+          },
+          "required": ["offer_id"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "FileError": {
+      "allOf": [
+        { "$ref": "#/$defs/Base" },
+        {
+          "type": "object",
+          "properties": {
+            "msg_type": { "const": "FILE_ERROR" },
+            "offer_id": { "type": "string", "format": "uuid" },
+            "message": { "type": "string" }
+          },
+          "required": ["offer_id"],
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}

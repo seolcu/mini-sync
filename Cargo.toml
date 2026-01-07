@@ -2,5 +2,6 @@
 resolver = "2"
 members = [
   "desktop/mini-sync",
+  "desktop/mini-sync-common",
   "desktop/mini-syncd",
 ]

@@ -1,9 +1,6 @@
 # proto
 
-Placeholder for message schema.
-
-Planned formats:
-- JSON Schema or protobuf
+Message schema lives in `messages.schema.json`.
 
 Initial message types (MVP):
 - HELLO
