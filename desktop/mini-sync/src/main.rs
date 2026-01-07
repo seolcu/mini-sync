@@ -582,6 +582,8 @@ fn print_status() {
     print_pairing_status(&pairing_path);
     let discovery_path = paths::discovery_file();
     println!("discovery_path: {}", discovery_path.display());
+    let clipboard_state_path = paths::clipboard_state_file();
+    println!("clipboard_state_path: {}", clipboard_state_path.display());
 
     match Config::load_optional(&config_path) {
         Ok(Some(config)) => {
@@ -599,7 +601,7 @@ fn print_status() {
         }
     }
 
-    println!("daemon_status: stub");
+    println!("daemon_status: use `mini-sync daemon-status`");
 }
 
 fn print_devices(show_available: bool, show_all: bool) {
@@ -689,6 +691,11 @@ fn print_config_summary(config: &Config) {
     );
     println!("download_dir: {}", config.download_dir.display());
     println!("clipboard.watch: {}", config.clipboard.watch);
+    if config.clipboard.targets.is_empty() {
+        println!("clipboard.targets: none");
+    } else {
+        println!("clipboard.targets: {}", config.clipboard.targets.join(","));
+    }
     println!("control.require_secure: {}", config.control.require_secure);
     println!("control.prefer_secure: {}", config.control.prefer_secure);
     println!("paired_devices: {}", config.paired_devices.len());
@@ -1022,7 +1029,7 @@ fn send_pair_request(
     let payload =
         serde_json::to_string(&message).map_err(|err| format!("json_error: {}", err))?;
 
-    let target = format!("{}:{}", addr, port);
+    let target = format_target(&addr, port);
     let response = send_plain_request(
         &target,
         &payload,
@@ -1045,8 +1052,13 @@ fn send_ping(
     let identity = Identity::load_or_generate(&paths::identity_file())
         .map_err(|err| format!("identity_load_failed: {}", err))?;
     let sender_device_id = device_id.unwrap_or_else(|| identity.device_id.clone());
-    let port = port_override.unwrap_or(config.listen_port);
-    let addr = addr.unwrap_or_else(|| "127.0.0.1".to_string());
+    let (addr, port) = match device.as_deref() {
+        Some(device_id) => resolve_target_for_device(device_id, addr, port_override, &config)?,
+        None => (
+            addr.unwrap_or_else(|| "127.0.0.1".to_string()),
+            port_override.unwrap_or(config.listen_port),
+        ),
+    };
 
     let message = PingMessage {
         version: 1,
@@ -1057,7 +1069,7 @@ fn send_ping(
     };
     let payload =
         serde_json::to_string(&message).map_err(|err| format!("json_error: {}", err))?;
-    let target = format!("{}:{}", addr, port);
+    let target = format_target(&addr, port);
     let context =
         resolve_secure_context(&config, device, peer_dh_pubkey, secure_flag)?;
     let response = send_control_request(
@@ -1087,8 +1099,13 @@ fn send_hello(
     let identity = Identity::load_or_generate(&paths::identity_file())
         .map_err(|err| format!("identity_load_failed: {}", err))?;
     let sender_device_id = device_id.unwrap_or_else(|| identity.device_id.clone());
-    let port = port_override.unwrap_or(config.listen_port);
-    let addr = addr.unwrap_or_else(|| "127.0.0.1".to_string());
+    let (addr, port) = match device.as_deref() {
+        Some(device_id) => resolve_target_for_device(device_id, addr, port_override, &config)?,
+        None => (
+            addr.unwrap_or_else(|| "127.0.0.1".to_string()),
+            port_override.unwrap_or(config.listen_port),
+        ),
+    };
     let device_name = device_name
         .or_else(|| config.device_name.clone())
         .unwrap_or_else(default_device_name);
@@ -1105,7 +1122,7 @@ fn send_hello(
     };
     let payload =
         serde_json::to_string(&message).map_err(|err| format!("json_error: {}", err))?;
-    let target = format!("{}:{}", addr, port);
+    let target = format_target(&addr, port);
     let context =
         resolve_secure_context(&config, device, peer_dh_pubkey, secure_flag)?;
     let response = send_control_request(
@@ -1133,8 +1150,13 @@ fn send_daemon_status(
     let identity = Identity::load_or_generate(&paths::identity_file())
         .map_err(|err| format!("identity_load_failed: {}", err))?;
     let sender_device_id = identity.device_id.clone();
-    let port = port_override.unwrap_or(config.listen_port);
-    let addr = addr.unwrap_or_else(|| "127.0.0.1".to_string());
+    let (addr, port) = match device.as_deref() {
+        Some(device_id) => resolve_target_for_device(device_id, addr, port_override, &config)?,
+        None => (
+            addr.unwrap_or_else(|| "127.0.0.1".to_string()),
+            port_override.unwrap_or(config.listen_port),
+        ),
+    };
 
     let message = StatusRequest {
         version: 1,
@@ -1146,7 +1168,7 @@ fn send_daemon_status(
     };
     let payload =
         serde_json::to_string(&message).map_err(|err| format!("json_error: {}", err))?;
-    let target = format!("{}:{}", addr, port);
+    let target = format_target(&addr, port);
     let context =
         resolve_secure_context(&config, device, peer_dh_pubkey, secure_flag)?;
     let response = send_control_request(
@@ -1223,7 +1245,7 @@ fn send_file_offer(
     let sender_device_id = identity.device_id.clone();
 
     let (addr, port) = resolve_target_for_device(&device, addr, port_override, &config)?;
-    let target = format!("{}:{}", addr, port);
+    let target = format_target(&addr, port);
     let local_ip = resolve_local_ip(&target)?;
     let offer_id = uuid::Uuid::new_v4().to_string();
     let prepared = prepare_file_offer(&input_paths, &offer_id)?;
@@ -1583,7 +1605,7 @@ fn send_clipboard_push(
     };
     let payload =
         serde_json::to_string(&message).map_err(|err| format!("json_error: {}", err))?;
-    let target = format!("{}:{}", addr, port);
+    let target = format_target(&addr, port);
     let context = resolve_secure_context(&config, Some(device), peer_dh_pubkey, secure_flag)?;
     let response = send_control_request(
         &target,
@@ -1623,6 +1645,14 @@ fn resolve_target_for_device(
     Ok((addr, port))
 }
 
+fn format_target(addr: &str, port: u16) -> String {
+    match addr.parse::<IpAddr>() {
+        Ok(IpAddr::V4(addr)) => format!("{}:{}", addr, port),
+        Ok(IpAddr::V6(addr)) => format!("[{}]:{}", addr, port),
+        Err(_) => format!("{}:{}", addr, port),
+    }
+}
+
 fn read_clipboard_text() -> Result<String, String> {
     let output = ProcessCommand::new("wl-paste")
         .arg("--no-newline")
@@ -1656,7 +1686,7 @@ fn watch_clipboard(
         .map_err(|err| format!("identity_load_failed: {}", err))?;
     let sender_device_id = identity.device_id.clone();
     let (addr, port) = resolve_target_for_device(&device, addr, port_override, &config)?;
-    let target = format!("{}:{}", addr, port);
+    let target = format_target(&addr, port);
     let context = resolve_secure_context(&config, Some(device), peer_dh_pubkey, secure_flag)?;
     let timeout = timeout_secs.unwrap_or(REQUEST_TIMEOUT_SECS);
 

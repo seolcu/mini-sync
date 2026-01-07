@@ -17,7 +17,7 @@ use std::env;
 use std::fs;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -82,7 +82,7 @@ struct StatusRequest {
     include_discovery: bool,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct ClipPush {
     version: u8,
     msg_id: String,
@@ -128,7 +128,7 @@ struct PairAccept {
     dh_pubkey: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct PairReject {
     version: u8,
     msg_id: String,
@@ -316,6 +316,16 @@ fn main() {
         .or_else(|| config.device_name.clone())
         .unwrap_or_else(default_device_name);
     println!("device_name: {}", device_name);
+
+    if config.clipboard.watch {
+        let identity_clone = identity.clone();
+        let config_path = config_path.clone();
+        thread::spawn(move || {
+            if let Err(err) = run_clipboard_watch(&identity_clone, &config_path) {
+                eprintln!("clipboard_watch_error: {}", err);
+            }
+        });
+    }
 
     if args.no_mdns {
         println!("mdns_status: disabled");
@@ -1511,9 +1521,7 @@ fn store_clipboard_state(
     timestamp_ms: u64,
     text: &str,
 ) -> Result<(), String> {
-    let mut hasher = Sha256::new();
-    hasher.update(text.as_bytes());
-    let text_hash = hex::encode(hasher.finalize());
+    let text_hash = hash_text(text);
     let state = ClipboardState {
         clip_id: clip_id.to_string(),
         sender_device_id: sender_device_id.to_string(),
@@ -1525,6 +1533,328 @@ fn store_clipboard_state(
         .save(&path)
         .map_err(|err| format!("clipboard_state_save_failed: {}", err))?;
     Ok(())
+}
+
+fn run_clipboard_watch(identity: &Identity, config_path: &Path) -> Result<(), String> {
+    let mut last_text = String::new();
+    let mut warned_no_targets = false;
+    loop {
+        let config = match load_config_or_default(config_path) {
+            Ok(config) => config,
+            Err(err) => {
+                eprintln!("clipboard_watch_config_error: {}", err);
+                thread::sleep(Duration::from_millis(CLIPBOARD_WATCH_INTERVAL_MS));
+                continue;
+            }
+        };
+        if !config.clipboard.watch {
+            thread::sleep(Duration::from_millis(CLIPBOARD_WATCH_INTERVAL_MS));
+            continue;
+        }
+        if config.clipboard.targets.is_empty() {
+            if !warned_no_targets {
+                eprintln!("clipboard_watch: no targets configured");
+                warned_no_targets = true;
+            }
+            thread::sleep(Duration::from_millis(CLIPBOARD_WATCH_INTERVAL_MS));
+            continue;
+        }
+        warned_no_targets = false;
+
+        let text = match read_clipboard_text() {
+            Ok(text) => text,
+            Err(err) => {
+                eprintln!("clipboard_read_error: {}", err);
+                thread::sleep(Duration::from_millis(CLIPBOARD_WATCH_INTERVAL_MS));
+                continue;
+            }
+        };
+        if text == last_text {
+            thread::sleep(Duration::from_millis(CLIPBOARD_WATCH_INTERVAL_MS));
+            continue;
+        }
+        if should_suppress_clipboard(&text, &identity.device_id)? {
+            last_text = text;
+            thread::sleep(Duration::from_millis(CLIPBOARD_WATCH_INTERVAL_MS));
+            continue;
+        }
+
+        let clip_id = new_msg_id();
+        for target in &config.clipboard.targets {
+            if let Err(err) = send_clipboard_push_to_device(
+                target,
+                &text,
+                identity,
+                &config,
+                &clip_id,
+            ) {
+                eprintln!("clipboard_push_error: {} {}", target, err);
+            }
+        }
+        if let Err(err) = store_clipboard_state(&clip_id, &identity.device_id, now_ms(), &text) {
+            eprintln!("clipboard_state_error: {}", err);
+        }
+        last_text = text;
+        thread::sleep(Duration::from_millis(CLIPBOARD_WATCH_INTERVAL_MS));
+    }
+}
+
+fn send_clipboard_push_to_device(
+    target_device_id: &str,
+    text: &str,
+    identity: &Identity,
+    config: &Config,
+    clip_id: &str,
+) -> Result<(), String> {
+    let peer = config
+        .paired_devices
+        .iter()
+        .find(|device| device.device_id == target_device_id)
+        .ok_or_else(|| "device_not_paired".to_string())?;
+    let Some((addr, port)) = resolve_discovered_target(target_device_id)? else {
+        return Err("device_not_discovered".to_string());
+    };
+    let peer_dh_pubkey = peer.dh_pubkey.as_deref();
+    let secure = if config.control.require_secure {
+        if peer_dh_pubkey.is_none() {
+            return Err("missing_peer_dh_key".to_string());
+        }
+        true
+    } else if config.control.prefer_secure && peer_dh_pubkey.is_some() {
+        true
+    } else {
+        false
+    };
+
+    let message = ClipPush {
+        version: 1,
+        msg_id: new_msg_id(),
+        sender_device_id: identity.device_id.clone(),
+        timestamp_ms: now_ms(),
+        msg_type: "CLIP_PUSH".to_string(),
+        content_type: "text/plain".to_string(),
+        text: text.to_string(),
+        clip_id: clip_id.to_string(),
+    };
+    let payload =
+        serde_json::to_string(&message).map_err(|err| format!("json_error: {}", err))?;
+    let target = format_target(&addr, port);
+
+    let response = if secure {
+        let peer_dh_pubkey = peer_dh_pubkey.ok_or_else(|| "missing_peer_dh_key".to_string())?;
+        send_secure_request(
+            &target,
+            &payload,
+            CONTROL_REQUEST_TIMEOUT_SECS,
+            identity,
+            &identity.device_id,
+            peer_dh_pubkey,
+        )?
+    } else {
+        send_plain_request(&target, &payload, CONTROL_REQUEST_TIMEOUT_SECS)?
+    };
+
+    let base: BaseMessage =
+        serde_json::from_str(&response).map_err(|_| "invalid_response".to_string())?;
+    if base.msg_type == "PAIR_REJECT" {
+        let reject: PairReject =
+            serde_json::from_str(&response).map_err(|_| "pair_reject".to_string())?;
+        return Err(format!("pair_reject: {}", reject.reason));
+    }
+    Ok(())
+}
+
+fn resolve_discovered_target(device_id: &str) -> Result<Option<(String, u16)>, String> {
+    let now = now_ms();
+    match DiscoveryState::load_optional(&paths::discovery_file()) {
+        Ok(Some(mut state)) => {
+            state.prune_expired(now, DISCOVERY_TTL_MS);
+            if let Some(device) = state.devices.iter().find(|entry| entry.device_id == device_id) {
+                if let Some(addr) = device.addresses.first() {
+                    return Ok(Some((addr.clone(), device.port)));
+                }
+            }
+            Ok(None)
+        }
+        Ok(None) => Ok(None),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn format_target(addr: &str, port: u16) -> String {
+    match addr.parse::<IpAddr>() {
+        Ok(IpAddr::V4(addr)) => format!("{}:{}", addr, port),
+        Ok(IpAddr::V6(addr)) => format!("[{}]:{}", addr, port),
+        Err(_) => format!("{}:{}", addr, port),
+    }
+}
+
+fn read_clipboard_text() -> Result<String, String> {
+    let output = Command::new("wl-paste")
+        .arg("--no-newline")
+        .arg("--type")
+        .arg("text/plain")
+        .output()
+        .map_err(|err| format!("wl-paste_failed: {}", err))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            return Err("wl-paste_failed".to_string());
+        }
+        return Err(format!("wl-paste_failed: {}", stderr));
+    }
+    let text = String::from_utf8(output.stdout).map_err(|err| format!("utf8_error: {}", err))?;
+    Ok(text)
+}
+
+fn should_suppress_clipboard(text: &str, local_device_id: &str) -> Result<bool, String> {
+    let state = ClipboardState::load_optional(&paths::clipboard_state_file())
+        .map_err(|err| format!("clipboard_state_load_failed: {}", err))?;
+    let Some(state) = state else {
+        return Ok(false);
+    };
+    if state.sender_device_id == local_device_id {
+        return Ok(false);
+    }
+    let now = now_ms();
+    if now.saturating_sub(state.timestamp_ms) > CLIPBOARD_ECHO_WINDOW_MS {
+        return Ok(false);
+    }
+    Ok(hash_text(text) == state.text_hash)
+}
+
+fn hash_text(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn send_plain_request(target: &str, payload: &str, timeout_secs: u64) -> Result<String, String> {
+    let mut stream = TcpStream::connect(target).map_err(|err| format!("connect_failed: {}", err))?;
+    let timeout = Duration::from_secs(timeout_secs);
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|err| format!("timeout_failed: {}", err))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|err| format!("timeout_failed: {}", err))?;
+    write_frame(&mut stream, payload.as_bytes())?;
+    let response = read_frame(&mut stream)?;
+    let response =
+        String::from_utf8(response).map_err(|err| format!("utf8_error: {}", err))?;
+    Ok(response.trim().to_string())
+}
+
+fn send_secure_request(
+    target: &str,
+    payload: &str,
+    timeout_secs: u64,
+    identity: &Identity,
+    sender_device_id: &str,
+    peer_dh_pubkey: &str,
+) -> Result<String, String> {
+    let dh_secret = identity
+        .dh_secret_key_bytes()
+        .map_err(|err| format!("dh_key_error: {}", err))?;
+    let peer_dh_pubkey = decode_key(peer_dh_pubkey, "peer dh pubkey")?;
+
+    let params: snow::params::NoiseParams = NOISE_PARAMS
+        .parse()
+        .map_err(|err| format!("noise_params_error: {}", err))?;
+    let builder = Builder::new(params)
+        .local_private_key(&dh_secret)
+        .remote_public_key(&peer_dh_pubkey);
+    let mut noise = builder
+        .build_initiator()
+        .map_err(|err| format!("noise_init_error: {}", err))?;
+
+    let mut stream = TcpStream::connect(target).map_err(|err| format!("connect_failed: {}", err))?;
+    let timeout = Duration::from_secs(timeout_secs);
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|err| format!("timeout_failed: {}", err))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|err| format!("timeout_failed: {}", err))?;
+
+    let mut handshake_out = vec![0u8; MAX_FRAME_SIZE];
+    let len = noise
+        .write_message(&[], &mut handshake_out)
+        .map_err(|err| format!("noise_write_failed: {}", err))?;
+    let init = SecureInit {
+        version: 1,
+        msg_id: new_msg_id(),
+        sender_device_id: sender_device_id.to_string(),
+        timestamp_ms: now_ms(),
+        msg_type: "SECURE_INIT".to_string(),
+        payload: STANDARD.encode(&handshake_out[..len]),
+    };
+    let init_json =
+        serde_json::to_string(&init).map_err(|err| format!("json_error: {}", err))?;
+    write_frame(&mut stream, init_json.as_bytes())?;
+
+    let response_raw = read_frame(&mut stream)?;
+    let response_str =
+        String::from_utf8(response_raw).map_err(|err| format!("utf8_error: {}", err))?;
+    let base: BaseMessage =
+        serde_json::from_str(&response_str).map_err(|err| format!("json_error: {}", err))?;
+    match base.msg_type.as_str() {
+        "SECURE_ACCEPT" => {
+            let accept: SecureAccept = serde_json::from_str(&response_str)
+                .map_err(|err| format!("json_error: {}", err))?;
+            let payload =
+                STANDARD.decode(accept.payload).map_err(|err| format!("b64_error: {}", err))?;
+            let mut handshake_in = vec![0u8; MAX_FRAME_SIZE];
+            noise
+                .read_message(&payload, &mut handshake_in)
+                .map_err(|err| format!("noise_read_failed: {}", err))?;
+        }
+        "SECURE_REJECT" => {
+            let reject: SecureReject = serde_json::from_str(&response_str)
+                .map_err(|err| format!("json_error: {}", err))?;
+            return Err(format!("secure_reject: {}", reject.reason));
+        }
+        _ => return Err("secure_invalid_response".to_string()),
+    }
+
+    let mut transport = noise
+        .into_transport_mode()
+        .map_err(|err| format!("noise_transport_failed: {}", err))?;
+    let mut cipher = vec![0u8; payload.len() + 64];
+    let len = transport
+        .write_message(payload.as_bytes(), &mut cipher)
+        .map_err(|err| format!("noise_encrypt_failed: {}", err))?;
+    let packet = SecurePacket {
+        version: 1,
+        msg_id: new_msg_id(),
+        sender_device_id: sender_device_id.to_string(),
+        timestamp_ms: now_ms(),
+        msg_type: "SECURE_PACKET".to_string(),
+        payload: STANDARD.encode(&cipher[..len]),
+    };
+    let packet_json =
+        serde_json::to_string(&packet).map_err(|err| format!("json_error: {}", err))?;
+    write_frame(&mut stream, packet_json.as_bytes())?;
+
+    let response_raw = read_frame(&mut stream)?;
+    let response_str =
+        String::from_utf8(response_raw).map_err(|err| format!("utf8_error: {}", err))?;
+    let packet: SecurePacket =
+        serde_json::from_str(&response_str).map_err(|err| format!("json_error: {}", err))?;
+    if packet.msg_type != "SECURE_PACKET" {
+        return Err("secure_invalid_packet".to_string());
+    }
+    let payload = STANDARD
+        .decode(packet.payload)
+        .map_err(|err| format!("b64_error: {}", err))?;
+    let mut plain = vec![0u8; payload.len() + 64];
+    let len = transport
+        .read_message(&payload, &mut plain)
+        .map_err(|err| format!("noise_decrypt_failed: {}", err))?;
+    let response =
+        String::from_utf8(plain[..len].to_vec()).map_err(|err| format!("utf8_error: {}", err))?;
+    Ok(response.trim().to_string())
 }
 
 fn default_device_name() -> String {
@@ -1543,6 +1873,9 @@ fn now_ms() -> u64 {
 
 const PAIRING_READ_TIMEOUT_SECS: u64 = 10;
 const DISCOVERY_TTL_MS: u64 = 300_000;
+const CLIPBOARD_WATCH_INTERVAL_MS: u64 = 500;
+const CLIPBOARD_ECHO_WINDOW_MS: u64 = 3_000;
+const CONTROL_REQUEST_TIMEOUT_SECS: u64 = 10;
 const FILE_TRANSFER_TIMEOUT_SECS: u64 = 120;
 const MAX_FRAME_SIZE: usize = 1_048_576;
 const NOISE_PARAMS: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";

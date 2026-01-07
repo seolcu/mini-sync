@@ -5,6 +5,7 @@ paired_devices = []
 
 [clipboard]
 watch = false
+targets = []
 
 [control]
 require_secure = false

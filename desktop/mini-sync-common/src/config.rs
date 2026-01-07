@@ -25,6 +25,8 @@ pub struct Config {
 pub struct ClipboardConfig {
     #[serde(default)]
     pub watch: bool,
+    #[serde(default)]
+    pub targets: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,7 +51,10 @@ pub struct PairedDevice {
 
 impl Default for ClipboardConfig {
     fn default() -> Self {
-        Self { watch: false }
+        Self {
+            watch: false,
+            targets: Vec::new(),
+        }
     }
 }
 

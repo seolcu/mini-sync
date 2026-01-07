@@ -12,22 +12,23 @@ Status: early dev; control channel, clipboard push/watch, and file offers are in
 
 ## Repository layout
 - desktop/ - Rust CLI and daemon
-- android/ - Android app (Kotlin + Jetpack Compose; TODO)
-- proto/ - Message schema (TODO)
+- android/ - Android app (Kotlin + Jetpack Compose)
+- proto/ - Message schema
 
 ## Quick start (desktop)
 - `cargo run -p mini-sync -- --help`
 - `cargo run -p mini-syncd -- --version`
-- Manual device entry (stub): `mini-sync pair --device-id <id> --pubkey <key> [--name <name>]`
+- Manual device entry: `mini-sync pair --device-id <id> --pubkey <key> [--name <name>]`
 - Optional DH key on manual entry: `--dh-pubkey <key>` (required for `--secure`)
 - Generate/load local identity: `mini-sync status` (writes `~/.local/state/mini-sync/identity.toml`)
-- Pairing QR payload (stub): `mini-sync pair` (use `--addr <ip>` / `--port <port>` as needed)
+- Pairing QR payload: `mini-sync pair` (use `--addr <ip>` / `--port <port>` as needed)
 - Send PAIR_REQUEST (dev helper): `mini-sync pair-request --addr <ip> --port <port>`
 - Control channel ping (paired only): `mini-sync ping --addr <ip> --port <port>`
 - Control channel hello (paired only): `mini-sync hello --addr <ip> --port <port>`
 - Control channel status (daemon IPC): `mini-sync daemon-status --addr <ip> --port <port> [--include-discovery]`
 - Clipboard push (paired only): `mini-sync clipboard push <device> --addr <ip> --port <port>`
 - Clipboard watch (paired only): `mini-sync clipboard watch <device> --addr <ip> --port <port>`
+- Daemon clipboard watch: set `clipboard.watch=true` and `clipboard.targets=["<device-id>"]` in `config.toml`
 - File send (paired only): `mini-sync send <device> <path...> --addr <ip> --port <port>`
 - Add `--secure --device <id>` to use Noise on control commands (requires dh keys)
 - mDNS advertise/browse (daemon): `mini-syncd` (prints discovered services)
@@ -39,6 +40,10 @@ Status: early dev; control channel, clipboard push/watch, and file offers are in
 - Discovered devices are cached in `~/.local/state/mini-sync/discovered.toml` (use `mini-sync devices --available`)
 - `mini-sync devices --all` shows paired + available
 - Discovery cache is pruned on updates/removals (TTL 5m)
+
+## File manager actions (examples)
+- Thunar: add a custom action with command `mini-sync send <device-id> %F`
+- Nautilus: create a script in `~/.local/share/nautilus/scripts/` that runs `mini-sync send <device-id> "$@"`
 
 ## Notes
 - Clipboard push uses `wl-paste` (client) and `wl-copy` (daemon); install `wl-clipboard`.
