@@ -6,6 +6,10 @@ paired_devices = []
 [clipboard]
 watch = false
 
+[control]
+require_secure = false
+prefer_secure = false
+
 # [[paired_devices]]
 # device_id = "device-id"
 # device_name = "phone"

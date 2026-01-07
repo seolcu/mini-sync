@@ -16,6 +16,8 @@ pub struct Config {
     #[serde(default)]
     pub clipboard: ClipboardConfig,
     #[serde(default)]
+    pub control: ControlConfig,
+    #[serde(default)]
     pub paired_devices: Vec<PairedDevice>,
 }
 
@@ -23,6 +25,14 @@ pub struct Config {
 pub struct ClipboardConfig {
     #[serde(default)]
     pub watch: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlConfig {
+    #[serde(default)]
+    pub require_secure: bool,
+    #[serde(default)]
+    pub prefer_secure: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +53,15 @@ impl Default for ClipboardConfig {
     }
 }
 
+impl Default for ControlConfig {
+    fn default() -> Self {
+        Self {
+            require_secure: false,
+            prefer_secure: false,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -50,6 +69,7 @@ impl Default for Config {
             device_name: None,
             download_dir: default_download_dir(),
             clipboard: ClipboardConfig::default(),
+            control: ControlConfig::default(),
             paired_devices: Vec::new(),
         }
     }

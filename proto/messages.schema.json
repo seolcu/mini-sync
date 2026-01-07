@@ -81,7 +81,8 @@
           "properties": {
             "msg_type": { "const": "PAIR_ACCEPT" },
             "code_confirm": { "type": "string", "pattern": "^[0-9]{6}$" },
-            "pubkey": { "type": "string" }
+            "pubkey": { "type": "string" },
+            "dh_pubkey": { "type": "string" }
           },
           "required": ["code_confirm", "pubkey"],
           "additionalProperties": false

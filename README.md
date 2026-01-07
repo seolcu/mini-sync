@@ -8,7 +8,7 @@ Goals:
 - Minimal dependencies, CLI + simple UI
 - No KDE/Qt/KF stack
 
-Status: skeleton (M0). CLI/daemon stubs only.
+Status: early dev; control channel, discovery cache, and clipboard push are in place.
 
 ## Repository layout
 - desktop/ - Rust CLI and daemon
@@ -26,16 +26,18 @@ Status: skeleton (M0). CLI/daemon stubs only.
 - Control channel ping (paired only): `mini-sync ping --addr <ip> --port <port>`
 - Control channel hello (paired only): `mini-sync hello --addr <ip> --port <port>`
 - Control channel status (daemon IPC): `mini-sync daemon-status --addr <ip> --port <port> [--include-discovery]`
+- Clipboard push (paired only): `mini-sync clipboard push <device> --addr <ip> --port <port>`
 - Add `--secure --device <id>` to use Noise on control commands (requires dh keys)
 - mDNS advertise/browse (daemon): `mini-syncd` (prints discovered services)
 - Pairing session is stored at `~/.local/state/mini-sync/pairing.toml` (use `--no-store` to skip)
 - Daemon listens on `listen_port` for length-prefixed JSON frames (u32 BE)
 - Control channel supports optional Noise IK handshake (`--secure`) using pinned dh keys
 - For `--secure`, pass `--device <id>` or `--peer-dh-pubkey <key>` so the peer key is known
+- `control.require_secure=true` rejects plaintext control messages (except pairing); `control.prefer_secure=true` auto-enables secure when keys exist
 - Discovered devices are cached in `~/.local/state/mini-sync/discovered.toml` (use `mini-sync devices --available`)
 - `mini-sync devices --all` shows paired + available
 - Discovery cache is pruned on updates/removals (TTL 5m)
 
 ## Notes
-- Wayland clipboard via `wl-clipboard` is planned
+- Clipboard push uses `wl-paste` (client) and `wl-copy` (daemon); install `wl-clipboard`.
 - Pairing + encrypted transport planned (see `AGENTS.md`)

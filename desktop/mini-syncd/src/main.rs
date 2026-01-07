@@ -16,6 +16,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
@@ -78,6 +79,18 @@ struct StatusRequest {
     include_discovery: bool,
 }
 
+#[derive(Deserialize)]
+struct ClipPush {
+    version: u8,
+    msg_id: String,
+    sender_device_id: String,
+    timestamp_ms: u64,
+    msg_type: String,
+    content_type: String,
+    text: String,
+    clip_id: String,
+}
+
 #[derive(Serialize)]
 struct PairAccept {
     version: u8,
@@ -87,6 +100,8 @@ struct PairAccept {
     msg_type: String,
     code_confirm: String,
     pubkey: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dh_pubkey: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -183,12 +198,23 @@ struct SecurePacket {
 }
 
 #[derive(Serialize)]
+struct ClipAck {
+    version: u8,
+    msg_id: String,
+    sender_device_id: String,
+    timestamp_ms: u64,
+    msg_type: String,
+    clip_id: String,
+}
+
+#[derive(Serialize)]
 #[serde(untagged)]
 enum ControlResponse {
     Accept(PairAccept),
     Reject(PairReject),
     Pong(Pong),
     Status(StatusResponse),
+    ClipAck(ClipAck),
 }
 
 fn main() {
@@ -328,6 +354,16 @@ fn handle_pairing_stream(
         return handle_secure_session(init, &mut stream, identity, config_path, pairing_path);
     }
 
+    let config = load_config_or_default(config_path)?;
+    if config.control.require_secure && base.msg_type != "PAIR_REQUEST" {
+        let response = reject(identity, "secure_required");
+        let response_json = serde_json::to_string(&response)
+            .map_err(|err| format!("pairing_json_failed: {}", err))?;
+        write_frame(&mut stream, response_json.as_bytes())
+            .map_err(|err| format!("pairing_write_failed: {}", err))?;
+        return Ok(());
+    }
+
     let response = handle_control_message(raw, identity, config_path, pairing_path);
     let response_json =
         serde_json::to_string(&response).map_err(|err| format!("pairing_json_failed: {}", err))?;
@@ -374,6 +410,13 @@ fn handle_control_message(
                 Err(_) => return reject(identity, "invalid_request"),
             };
             handle_status_request(request, identity, config_path)
+        }
+        "CLIP_PUSH" => {
+            let request: ClipPush = match serde_json::from_str(raw) {
+                Ok(request) => request,
+                Err(_) => return reject(identity, "invalid_request"),
+            };
+            handle_clip_push(request, identity, config_path)
         }
         _ => reject(identity, "unsupported_msg_type"),
     }
@@ -555,6 +598,47 @@ fn handle_status_request(
     })
 }
 
+fn handle_clip_push(
+    request: ClipPush,
+    identity: &Identity,
+    config_path: &Path,
+) -> ControlResponse {
+    let _ = request.msg_id.as_str();
+    let _ = request.timestamp_ms;
+    if request.msg_type != "CLIP_PUSH" {
+        return reject(identity, "invalid_msg_type");
+    }
+    if request.version != 1 {
+        return reject(identity, "unsupported_version");
+    }
+    if request.sender_device_id == identity.device_id {
+        return reject(identity, "self_clip_push_not_allowed");
+    }
+    if request.content_type != "text/plain" {
+        return reject(identity, "unsupported_content_type");
+    }
+    if Uuid::parse_str(&request.clip_id).is_err() {
+        return reject(identity, "invalid_clip_id");
+    }
+    let now = now_ms();
+    match update_paired_device(config_path, &request.sender_device_id, None, now) {
+        Ok(true) => {}
+        Ok(false) => return reject(identity, "unpaired_device"),
+        Err(err) => return reject(identity, &format!("config_error: {}", err)),
+    }
+    if let Err(err) = set_clipboard_text(&request.text) {
+        return reject(identity, &format!("clipboard_failed: {}", err));
+    }
+    ControlResponse::ClipAck(ClipAck {
+        version: 1,
+        msg_id: new_msg_id(),
+        sender_device_id: identity.device_id.clone(),
+        timestamp_ms: now_ms(),
+        msg_type: "CLIP_ACK".to_string(),
+        clip_id: request.clip_id,
+    })
+}
+
 fn handle_secure_session(
     init: SecureInit,
     stream: &mut TcpStream,
@@ -692,6 +776,7 @@ fn accept(identity: &Identity, code_confirm: String) -> ControlResponse {
         msg_type: "PAIR_ACCEPT".to_string(),
         code_confirm,
         pubkey: identity.public_key.clone(),
+        dh_pubkey: identity.dh_public_key.clone(),
     })
 }
 
@@ -983,6 +1068,26 @@ fn short_device_id(device_id: &str) -> String {
         .next()
         .unwrap_or(device_id)
         .to_string()
+}
+
+fn set_clipboard_text(text: &str) -> Result<(), String> {
+    let mut child = Command::new("wl-copy")
+        .arg("--type")
+        .arg("text/plain")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| format!("wl-copy_failed: {}", err))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(text.as_bytes())
+            .map_err(|err| format!("wl-copy_write_failed: {}", err))?;
+    }
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
 }
 
 fn default_device_name() -> String {

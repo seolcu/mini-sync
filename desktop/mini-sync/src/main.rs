@@ -16,6 +16,7 @@ use std::env;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
@@ -148,7 +149,21 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ClipboardCommand {
-    Push { device: String },
+    Push {
+        device: String,
+        #[arg(long)]
+        addr: Option<String>,
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        secure: bool,
+        #[arg(long)]
+        peer_dh_pubkey: Option<String>,
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long)]
+        timeout_secs: Option<u64>,
+    },
     Watch { device: String },
 }
 
@@ -300,8 +315,27 @@ fn main() {
             );
         }
         Command::Clipboard { command } => match command {
-            ClipboardCommand::Push { device } => {
-                println!("clipboard push to {}: not implemented yet", device);
+            ClipboardCommand::Push {
+                device,
+                addr,
+                port,
+                secure,
+                peer_dh_pubkey,
+                text,
+                timeout_secs,
+            } => {
+                if let Err(err) = send_clipboard_push(
+                    device,
+                    addr,
+                    port,
+                    secure,
+                    peer_dh_pubkey,
+                    text,
+                    timeout_secs,
+                ) {
+                    eprintln!("clipboard_push_error: {}", err);
+                    std::process::exit(1);
+                }
             }
             ClipboardCommand::Watch { device } => {
                 println!("clipboard watch for {}: not implemented yet", device);
@@ -585,6 +619,8 @@ fn print_config_summary(config: &Config) {
     );
     println!("download_dir: {}", config.download_dir.display());
     println!("clipboard.watch: {}", config.clipboard.watch);
+    println!("control.require_secure: {}", config.control.require_secure);
+    println!("control.prefer_secure: {}", config.control.prefer_secure);
     println!("paired_devices: {}", config.paired_devices.len());
 }
 
@@ -767,6 +803,11 @@ struct ResponseBase {
     reason: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct ClipAckResponse {
+    clip_id: String,
+}
+
 #[derive(Serialize)]
 struct SecureInit {
     version: u8,
@@ -797,6 +838,18 @@ struct SecurePacket {
     timestamp_ms: u64,
     msg_type: String,
     payload: String,
+}
+
+#[derive(Serialize)]
+struct ClipPushMessage {
+    version: u8,
+    msg_id: String,
+    sender_device_id: String,
+    timestamp_ms: u64,
+    msg_type: String,
+    content_type: String,
+    text: String,
+    clip_id: String,
 }
 
 fn send_pair_request(
@@ -865,7 +918,7 @@ fn send_ping(
     port_override: Option<u16>,
     device: Option<String>,
     peer_dh_pubkey: Option<String>,
-    secure: bool,
+    secure_flag: bool,
     device_id: Option<String>,
     timeout_secs: Option<u64>,
 ) -> Result<(), String> {
@@ -886,15 +939,15 @@ fn send_ping(
     let payload =
         serde_json::to_string(&message).map_err(|err| format!("json_error: {}", err))?;
     let target = format!("{}:{}", addr, port);
-    let peer_dh_pubkey = resolve_peer_dh_pubkey(&config, device, peer_dh_pubkey)?;
+    let context =
+        resolve_secure_context(&config, device, peer_dh_pubkey, secure_flag)?;
     let response = send_control_request(
         &target,
         &payload,
         timeout_secs.unwrap_or(REQUEST_TIMEOUT_SECS),
-        secure,
         &identity,
         &sender_device_id,
-        peer_dh_pubkey,
+        context,
     )?;
     print_control_response(&response);
     Ok(())
@@ -905,7 +958,7 @@ fn send_hello(
     port_override: Option<u16>,
     device: Option<String>,
     peer_dh_pubkey: Option<String>,
-    secure: bool,
+    secure_flag: bool,
     device_id: Option<String>,
     device_name: Option<String>,
     capabilities: Option<Vec<String>>,
@@ -934,15 +987,15 @@ fn send_hello(
     let payload =
         serde_json::to_string(&message).map_err(|err| format!("json_error: {}", err))?;
     let target = format!("{}:{}", addr, port);
-    let peer_dh_pubkey = resolve_peer_dh_pubkey(&config, device, peer_dh_pubkey)?;
+    let context =
+        resolve_secure_context(&config, device, peer_dh_pubkey, secure_flag)?;
     let response = send_control_request(
         &target,
         &payload,
         timeout_secs.unwrap_or(REQUEST_TIMEOUT_SECS),
-        secure,
         &identity,
         &sender_device_id,
-        peer_dh_pubkey,
+        context,
     )?;
     print_control_response(&response);
     Ok(())
@@ -953,7 +1006,7 @@ fn send_daemon_status(
     port_override: Option<u16>,
     device: Option<String>,
     peer_dh_pubkey: Option<String>,
-    secure: bool,
+    secure_flag: bool,
     include_discovery: bool,
     timeout_secs: Option<u64>,
 ) -> Result<(), String> {
@@ -975,15 +1028,15 @@ fn send_daemon_status(
     let payload =
         serde_json::to_string(&message).map_err(|err| format!("json_error: {}", err))?;
     let target = format!("{}:{}", addr, port);
-    let peer_dh_pubkey = resolve_peer_dh_pubkey(&config, device, peer_dh_pubkey)?;
+    let context =
+        resolve_secure_context(&config, device, peer_dh_pubkey, secure_flag)?;
     let response = send_control_request(
         &target,
         &payload,
         timeout_secs.unwrap_or(REQUEST_TIMEOUT_SECS),
-        secure,
         &identity,
         &sender_device_id,
-        peer_dh_pubkey,
+        context,
     )?;
 
     let status: StatusResponse =
@@ -1026,17 +1079,112 @@ fn send_daemon_status(
     Ok(())
 }
 
+fn send_clipboard_push(
+    device: String,
+    addr: Option<String>,
+    port_override: Option<u16>,
+    secure_flag: bool,
+    peer_dh_pubkey: Option<String>,
+    text: Option<String>,
+    timeout_secs: Option<u64>,
+) -> Result<(), String> {
+    let config = load_config_or_default(&paths::config_file())?;
+    let identity = Identity::load_or_generate(&paths::identity_file())
+        .map_err(|err| format!("identity_load_failed: {}", err))?;
+    let sender_device_id = identity.device_id.clone();
+
+    let (addr, port) = resolve_target_for_device(&device, addr, port_override, &config)?;
+    let text = match text {
+        Some(text) => text,
+        None => read_clipboard_text()?,
+    };
+
+    let message = ClipPushMessage {
+        version: 1,
+        msg_id: uuid::Uuid::new_v4().to_string(),
+        sender_device_id: sender_device_id.clone(),
+        timestamp_ms: now_ms(),
+        msg_type: "CLIP_PUSH".to_string(),
+        content_type: "text/plain".to_string(),
+        text,
+        clip_id: uuid::Uuid::new_v4().to_string(),
+    };
+    let payload =
+        serde_json::to_string(&message).map_err(|err| format!("json_error: {}", err))?;
+    let target = format!("{}:{}", addr, port);
+    let context = resolve_secure_context(&config, Some(device), peer_dh_pubkey, secure_flag)?;
+    let response = send_control_request(
+        &target,
+        &payload,
+        timeout_secs.unwrap_or(REQUEST_TIMEOUT_SECS),
+        &identity,
+        &sender_device_id,
+        context,
+    )?;
+    print_control_response(&response);
+    Ok(())
+}
+
+fn resolve_target_for_device(
+    device_id: &str,
+    addr: Option<String>,
+    port_override: Option<u16>,
+    config: &Config,
+) -> Result<(String, u16), String> {
+    let mut discovered_addr = None;
+    let mut discovered_port = None;
+    if let Ok(Some(mut state)) = DiscoveryState::load_optional(&paths::discovery_file()) {
+        state.prune_expired(now_ms(), DISCOVERY_TTL_MS);
+        if let Some(device) = state.devices.iter().find(|entry| entry.device_id == device_id) {
+            if let Some(addr) = device.addresses.first() {
+                discovered_addr = Some(addr.clone());
+                discovered_port = Some(device.port);
+            }
+        }
+    }
+    let addr = addr
+        .or(discovered_addr)
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let port = port_override
+        .or(discovered_port)
+        .unwrap_or(config.listen_port);
+    Ok((addr, port))
+}
+
+fn read_clipboard_text() -> Result<String, String> {
+    let output = ProcessCommand::new("wl-paste")
+        .arg("--no-newline")
+        .arg("--type")
+        .arg("text/plain")
+        .output()
+        .map_err(|err| format!("wl-paste_failed: {}", err))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        if stderr.is_empty() {
+            return Err("wl-paste_failed".to_string());
+        }
+        return Err(format!("wl-paste_failed: {}", stderr));
+    }
+    let text = String::from_utf8(output.stdout).map_err(|err| format!("utf8_error: {}", err))?;
+    Ok(text)
+}
+
+struct SecureContext {
+    secure: bool,
+    peer_dh_pubkey: Option<String>,
+}
+
 fn send_control_request(
     target: &str,
     payload: &str,
     timeout_secs: u64,
-    secure: bool,
     identity: &Identity,
     sender_device_id: &str,
-    peer_dh_pubkey: Option<String>,
+    context: SecureContext,
 ) -> Result<String, String> {
-    if secure {
-        let peer_dh_pubkey = peer_dh_pubkey.ok_or_else(|| {
+    if context.secure {
+        let peer_dh_pubkey = context.peer_dh_pubkey.ok_or_else(|| {
             "missing peer dh pubkey (use --device or --peer-dh-pubkey)".to_string()
         })?;
         send_secure_request(
@@ -1052,14 +1200,43 @@ fn send_control_request(
     }
 }
 
-fn resolve_peer_dh_pubkey(
+fn resolve_secure_context(
     config: &Config,
     device: Option<String>,
     peer_dh_pubkey: Option<String>,
-) -> Result<Option<String>, String> {
-    if let Some(value) = peer_dh_pubkey {
-        return Ok(Some(value));
+    secure_flag: bool,
+) -> Result<SecureContext, String> {
+    let provided_key = peer_dh_pubkey.is_some();
+    let mut peer_key = resolve_peer_dh_pubkey(config, device)?;
+    if peer_dh_pubkey.is_some() {
+        peer_key = peer_dh_pubkey;
     }
+    let require_secure = config.control.require_secure;
+    let prefer_secure = config.control.prefer_secure;
+
+    let secure = if secure_flag {
+        true
+    } else if require_secure {
+        true
+    } else if provided_key {
+        true
+    } else if prefer_secure && peer_key.is_some() {
+        true
+    } else {
+        false
+    };
+
+    if secure && peer_key.is_none() {
+        return Err("missing peer dh pubkey (use --device or --peer-dh-pubkey)".to_string());
+    }
+
+    Ok(SecureContext {
+        secure,
+        peer_dh_pubkey: peer_key,
+    })
+}
+
+fn resolve_peer_dh_pubkey(config: &Config, device: Option<String>) -> Result<Option<String>, String> {
     let Some(device_id) = device else {
         return Ok(None);
     };
@@ -1246,6 +1423,13 @@ fn print_control_response(response: &str) {
     match serde_json::from_str::<ResponseBase>(response) {
         Ok(parsed) if parsed.msg_type == "PONG" => {
             println!("pong: ok");
+        }
+        Ok(parsed) if parsed.msg_type == "CLIP_ACK" => {
+            if let Ok(ack) = serde_json::from_str::<ClipAckResponse>(response) {
+                println!("clip_ack: {}", ack.clip_id);
+            } else {
+                println!("clip_ack");
+            }
         }
         Ok(parsed) if parsed.msg_type == "PAIR_REJECT" => {
             if let Some(reason) = parsed.reason {
