@@ -73,6 +73,12 @@ impl DiscoveryState {
         self.devices
             .retain(|device| now_ms.saturating_sub(device.last_seen_ms) <= ttl_ms);
     }
+
+    pub fn remove_device(&mut self, device_id: &str) -> bool {
+        let before = self.devices.len();
+        self.devices.retain(|device| device.device_id != device_id);
+        before != self.devices.len()
+    }
 }
 
 #[derive(Debug)]

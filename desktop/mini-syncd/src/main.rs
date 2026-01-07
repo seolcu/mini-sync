@@ -455,20 +455,29 @@ fn run_mdns(
         .map_err(|err| format!("mdns_browse_failed: {}", err))?;
     println!("mdns_status: running");
 
+    let mut fullname_map: HashMap<String, String> = HashMap::new();
     loop {
         match receiver.recv() {
             Ok(ServiceEvent::ServiceResolved(info)) => {
                 if let Some(device) =
                     build_discovered_device(&info, &identity.device_id, now_ms())
                 {
+                    fullname_map.insert(info.get_fullname().to_string(), device.device_id.clone());
                     print_discovered_device(&device);
-                    if let Err(err) = store_discovered_device(&discovery_path, device) {
+                    if let Err(err) =
+                        store_discovered_device(&discovery_path, device, DISCOVERY_TTL_MS)
+                    {
                         eprintln!("discovery_store_error: {}", err);
                     }
                 }
             }
             Ok(ServiceEvent::ServiceRemoved(_ty, fullname)) => {
                 println!("mdns_removed: {}", fullname);
+                if let Some(device_id) = fullname_map.remove(&fullname) {
+                    if let Err(err) = remove_discovered_device(&discovery_path, &device_id) {
+                        eprintln!("discovery_remove_error: {}", err);
+                    }
+                }
             }
             Ok(ServiceEvent::SearchStarted(_)) | Ok(ServiceEvent::SearchStopped(_)) => {}
             Ok(ServiceEvent::ServiceFound(_, _)) => {}
@@ -543,13 +552,26 @@ fn print_discovered_device(device: &DiscoveredDevice) {
 fn store_discovered_device(
     discovery_path: &Path,
     device: DiscoveredDevice,
+    ttl_ms: u64,
 ) -> Result<(), String> {
     let mut state =
         DiscoveryState::load_or_default(discovery_path).map_err(|err| err.to_string())?;
+    state.prune_expired(device.last_seen_ms, ttl_ms);
     state.upsert(device);
     state
         .save(discovery_path)
         .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+fn remove_discovered_device(discovery_path: &Path, device_id: &str) -> Result<(), String> {
+    let mut state =
+        DiscoveryState::load_or_default(discovery_path).map_err(|err| err.to_string())?;
+    if state.remove_device(device_id) {
+        state
+            .save(discovery_path)
+            .map_err(|err| err.to_string())?;
+    }
     Ok(())
 }
 
@@ -640,3 +662,4 @@ fn now_ms() -> u64 {
 }
 
 const PAIRING_READ_TIMEOUT_SECS: u64 = 10;
+const DISCOVERY_TTL_MS: u64 = 300_000;

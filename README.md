@@ -30,6 +30,7 @@ Status: skeleton (M0). CLI/daemon stubs only.
 - Pairing requests are newline-delimited JSON (one message per line)
 - Discovered devices are cached in `~/.local/state/mini-sync/discovered.toml` (use `mini-sync devices --available`)
 - `mini-sync devices --all` shows paired + available
+- Discovery cache is pruned on updates/removals (TTL 5m)
 
 ## Notes
 - Wayland clipboard via `wl-clipboard` is planned
