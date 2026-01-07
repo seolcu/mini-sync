@@ -10,4 +10,5 @@ watch = false
 # device_id = "device-id"
 # device_name = "phone"
 # pubkey = "base64-encoded-pubkey"
+# dh_pubkey = "base64-encoded-dh-pubkey"
 # last_seen_ms = 0

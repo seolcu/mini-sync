@@ -11,6 +11,8 @@ pub struct PairingSession {
     pub device_name: String,
     pub public_key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub dh_public_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub addr: Option<String>,
     pub port: u16,
     pub token: String,

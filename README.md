@@ -19,15 +19,19 @@ Status: skeleton (M0). CLI/daemon stubs only.
 - `cargo run -p mini-sync -- --help`
 - `cargo run -p mini-syncd -- --version`
 - Manual device entry (stub): `mini-sync pair --device-id <id> --pubkey <key> [--name <name>]`
+- Optional DH key on manual entry: `--dh-pubkey <key>` (required for `--secure`)
 - Generate/load local identity: `mini-sync status` (writes `~/.local/state/mini-sync/identity.toml`)
 - Pairing QR payload (stub): `mini-sync pair` (use `--addr <ip>` / `--port <port>` as needed)
 - Send PAIR_REQUEST (dev helper): `mini-sync pair-request --addr <ip> --port <port>`
 - Control channel ping (paired only): `mini-sync ping --addr <ip> --port <port>`
 - Control channel hello (paired only): `mini-sync hello --addr <ip> --port <port>`
+- Control channel status (daemon IPC): `mini-sync daemon-status --addr <ip> --port <port> [--include-discovery]`
+- Add `--secure --device <id>` to use Noise on control commands (requires dh keys)
 - mDNS advertise/browse (daemon): `mini-syncd` (prints discovered services)
 - Pairing session is stored at `~/.local/state/mini-sync/pairing.toml` (use `--no-store` to skip)
-- Daemon listens on `listen_port` for JSON `PAIR_REQUEST` messages and replies with `PAIR_ACCEPT`/`PAIR_REJECT`
-- Pairing requests are newline-delimited JSON (one message per line)
+- Daemon listens on `listen_port` for length-prefixed JSON frames (u32 BE)
+- Control channel supports optional Noise IK handshake (`--secure`) using pinned dh keys
+- For `--secure`, pass `--device <id>` or `--peer-dh-pubkey <key>` so the peer key is known
 - Discovered devices are cached in `~/.local/state/mini-sync/discovered.toml` (use `mini-sync devices --available`)
 - `mini-sync devices --all` shows paired + available
 - Discovery cache is pruned on updates/removals (TTL 5m)

@@ -9,6 +9,12 @@
     { "$ref": "#/$defs/PairReject" },
     { "$ref": "#/$defs/Ping" },
     { "$ref": "#/$defs/Pong" },
+    { "$ref": "#/$defs/StatusRequest" },
+    { "$ref": "#/$defs/StatusResponse" },
+    { "$ref": "#/$defs/SecureInit" },
+    { "$ref": "#/$defs/SecureAccept" },
+    { "$ref": "#/$defs/SecureReject" },
+    { "$ref": "#/$defs/SecurePacket" },
     { "$ref": "#/$defs/ClipPush" },
     { "$ref": "#/$defs/ClipAck" },
     { "$ref": "#/$defs/FileOffer" },
@@ -59,6 +65,7 @@
             "token": { "type": "string" },
             "code": { "type": "string", "pattern": "^[0-9]{6}$" },
             "pubkey": { "type": "string" },
+            "dh_pubkey": { "type": "string" },
             "device_name": { "type": "string" }
           },
           "required": ["token", "code", "pubkey"],
@@ -114,6 +121,126 @@
           "properties": {
             "msg_type": { "const": "PONG" }
           },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "StatusRequest": {
+      "allOf": [
+        { "$ref": "#/$defs/Base" },
+        {
+          "type": "object",
+          "properties": {
+            "msg_type": { "const": "STATUS_REQUEST" },
+            "include_discovery": { "type": "boolean" }
+          },
+          "required": ["include_discovery"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "StatusPairedDevice": {
+      "type": "object",
+      "properties": {
+        "device_id": { "type": "string" },
+        "device_name": { "type": "string" },
+        "last_seen_ms": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["device_id"],
+      "additionalProperties": false
+    },
+    "StatusAvailableDevice": {
+      "type": "object",
+      "properties": {
+        "device_id": { "type": "string" },
+        "device_name": { "type": "string" },
+        "capabilities": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "addresses": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "last_seen_ms": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["device_id", "port", "last_seen_ms"],
+      "additionalProperties": false
+    },
+    "StatusResponse": {
+      "allOf": [
+        { "$ref": "#/$defs/Base" },
+        {
+          "type": "object",
+          "properties": {
+            "msg_type": { "const": "STATUS_RESPONSE" },
+            "paired_devices": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/StatusPairedDevice" }
+            },
+            "available_devices": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/StatusAvailableDevice" }
+            }
+          },
+          "required": ["paired_devices"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "SecureInit": {
+      "allOf": [
+        { "$ref": "#/$defs/Base" },
+        {
+          "type": "object",
+          "properties": {
+            "msg_type": { "const": "SECURE_INIT" },
+            "payload": { "type": "string" }
+          },
+          "required": ["payload"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "SecureAccept": {
+      "allOf": [
+        { "$ref": "#/$defs/Base" },
+        {
+          "type": "object",
+          "properties": {
+            "msg_type": { "const": "SECURE_ACCEPT" },
+            "payload": { "type": "string" }
+          },
+          "required": ["payload"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "SecureReject": {
+      "allOf": [
+        { "$ref": "#/$defs/Base" },
+        {
+          "type": "object",
+          "properties": {
+            "msg_type": { "const": "SECURE_REJECT" },
+            "reason": { "type": "string" }
+          },
+          "required": ["reason"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "SecurePacket": {
+      "allOf": [
+        { "$ref": "#/$defs/Base" },
+        {
+          "type": "object",
+          "properties": {
+            "msg_type": { "const": "SECURE_PACKET" },
+            "payload": { "type": "string" }
+          },
+          "required": ["payload"],
           "additionalProperties": false
         }
       ]

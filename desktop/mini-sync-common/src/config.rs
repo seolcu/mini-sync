@@ -32,6 +32,8 @@ pub struct PairedDevice {
     pub device_name: Option<String>,
     pub pubkey: String,
     #[serde(default)]
+    pub dh_pubkey: Option<String>,
+    #[serde(default)]
     pub last_seen_ms: Option<u64>,
 }
 

@@ -6,14 +6,16 @@ use mini_sync_common::{
     pairing::PairingSession,
     paths,
 };
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use qrcode::QrCode;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use snow::Builder;
+use std::collections::HashSet;
 use std::env;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
@@ -38,6 +40,8 @@ enum Command {
         device_id: Option<String>,
         #[arg(long)]
         pubkey: Option<String>,
+        #[arg(long)]
+        dh_pubkey: Option<String>,
         #[arg(long)]
         name: Option<String>,
         #[arg(long)]
@@ -69,6 +73,8 @@ enum Command {
         #[arg(long)]
         pubkey: Option<String>,
         #[arg(long)]
+        dh_pubkey: Option<String>,
+        #[arg(long)]
         device_name: Option<String>,
         #[arg(long)]
         timeout_secs: Option<u64>,
@@ -78,6 +84,12 @@ enum Command {
         addr: Option<String>,
         #[arg(long)]
         port: Option<u16>,
+        #[arg(long)]
+        device: Option<String>,
+        #[arg(long)]
+        peer_dh_pubkey: Option<String>,
+        #[arg(long)]
+        secure: bool,
         #[arg(long)]
         device_id: Option<String>,
         #[arg(long)]
@@ -89,11 +101,33 @@ enum Command {
         #[arg(long)]
         port: Option<u16>,
         #[arg(long)]
+        device: Option<String>,
+        #[arg(long)]
+        peer_dh_pubkey: Option<String>,
+        #[arg(long)]
+        secure: bool,
+        #[arg(long)]
         device_id: Option<String>,
         #[arg(long)]
         device_name: Option<String>,
         #[arg(long, value_delimiter = ',')]
         capabilities: Option<Vec<String>>,
+        #[arg(long)]
+        timeout_secs: Option<u64>,
+    },
+    DaemonStatus {
+        #[arg(long)]
+        addr: Option<String>,
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        device: Option<String>,
+        #[arg(long)]
+        peer_dh_pubkey: Option<String>,
+        #[arg(long)]
+        secure: bool,
+        #[arg(long)]
+        include_discovery: bool,
         #[arg(long)]
         timeout_secs: Option<u64>,
     },
@@ -127,6 +161,7 @@ fn main() {
         Command::Pair {
             device_id,
             pubkey,
+            dh_pubkey,
             name,
             last_seen_ms,
             addr,
@@ -140,6 +175,7 @@ fn main() {
                 if let Err(err) = upsert_device(
                     &device_id,
                     pubkey,
+                    dh_pubkey,
                     name,
                     last_seen_ms,
                     &paths::config_file(),
@@ -161,6 +197,7 @@ fn main() {
             code,
             sender_device_id,
             pubkey,
+            dh_pubkey,
             device_name,
             timeout_secs,
         } => {
@@ -171,6 +208,7 @@ fn main() {
                 code,
                 sender_device_id,
                 pubkey,
+                dh_pubkey,
                 device_name,
                 timeout_secs,
             ) {
@@ -181,10 +219,21 @@ fn main() {
         Command::Ping {
             addr,
             port,
+            device,
+            peer_dh_pubkey,
+            secure,
             device_id,
             timeout_secs,
         } => {
-            if let Err(err) = send_ping(addr, port, device_id, timeout_secs) {
+            if let Err(err) = send_ping(
+                addr,
+                port,
+                device,
+                peer_dh_pubkey,
+                secure,
+                device_id,
+                timeout_secs,
+            ) {
                 eprintln!("ping_error: {}", err);
                 std::process::exit(1);
             }
@@ -192,6 +241,9 @@ fn main() {
         Command::Hello {
             addr,
             port,
+            device,
+            peer_dh_pubkey,
+            secure,
             device_id,
             device_name,
             capabilities,
@@ -200,12 +252,37 @@ fn main() {
             if let Err(err) = send_hello(
                 addr,
                 port,
+                device,
+                peer_dh_pubkey,
+                secure,
                 device_id,
                 device_name,
                 capabilities,
                 timeout_secs,
             ) {
                 eprintln!("hello_error: {}", err);
+                std::process::exit(1);
+            }
+        }
+        Command::DaemonStatus {
+            addr,
+            port,
+            device,
+            peer_dh_pubkey,
+            secure,
+            include_discovery,
+            timeout_secs,
+        } => {
+            if let Err(err) = send_daemon_status(
+                addr,
+                port,
+                device,
+                peer_dh_pubkey,
+                secure,
+                include_discovery,
+                timeout_secs,
+            ) {
+                eprintln!("daemon_status_error: {}", err);
                 std::process::exit(1);
             }
         }
@@ -258,6 +335,7 @@ fn print_pairing_payload(
         device_id: identity.device_id,
         device_name,
         public_key: identity.public_key,
+        dh_public_key: identity.dh_public_key.clone(),
         addr,
         port,
         token: random_token(),
@@ -327,6 +405,7 @@ fn random_code() -> String {
 fn upsert_device(
     device_id: &str,
     pubkey: Option<String>,
+    dh_pubkey: Option<String>,
     name: Option<String>,
     last_seen_ms: Option<u64>,
     config_path: &Path,
@@ -342,6 +421,9 @@ fn upsert_device(
         if let Some(pubkey) = pubkey {
             existing.pubkey = pubkey;
         }
+        if dh_pubkey.is_some() {
+            existing.dh_pubkey = dh_pubkey;
+        }
         if name.is_some() {
             existing.device_name = name;
         }
@@ -355,6 +437,7 @@ fn upsert_device(
             device_id: device_id.to_string(),
             device_name: name,
             pubkey,
+            dh_pubkey,
             last_seen_ms,
         });
     }
@@ -613,6 +696,8 @@ struct PairRequestMessage {
     code: String,
     pubkey: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    dh_pubkey: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     device_name: Option<String>,
 }
 
@@ -636,10 +721,82 @@ struct HelloMessage {
     capabilities: Vec<String>,
 }
 
+#[derive(Serialize)]
+struct StatusRequest {
+    version: u8,
+    msg_id: String,
+    sender_device_id: String,
+    timestamp_ms: u64,
+    msg_type: String,
+    include_discovery: bool,
+}
+
+#[derive(Deserialize)]
+struct StatusResponse {
+    msg_type: String,
+    paired_devices: Vec<StatusPairedDevice>,
+    #[serde(default)]
+    available_devices: Option<Vec<StatusAvailableDevice>>,
+}
+
+#[derive(Deserialize)]
+struct StatusPairedDevice {
+    device_id: String,
+    #[serde(default)]
+    device_name: Option<String>,
+    #[serde(default)]
+    last_seen_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct StatusAvailableDevice {
+    device_id: String,
+    #[serde(default)]
+    device_name: Option<String>,
+    #[serde(default)]
+    capabilities: Vec<String>,
+    #[serde(default)]
+    addresses: Vec<String>,
+    port: u16,
+    last_seen_ms: u64,
+}
+
 #[derive(Deserialize)]
 struct ResponseBase {
     msg_type: String,
     reason: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SecureInit {
+    version: u8,
+    msg_id: String,
+    sender_device_id: String,
+    timestamp_ms: u64,
+    msg_type: String,
+    payload: String,
+}
+
+#[derive(Deserialize)]
+struct SecureAccept {
+    msg_type: String,
+    payload: String,
+}
+
+#[derive(Deserialize)]
+struct SecureReject {
+    msg_type: String,
+    reason: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SecurePacket {
+    version: u8,
+    msg_id: String,
+    sender_device_id: String,
+    timestamp_ms: u64,
+    msg_type: String,
+    payload: String,
 }
 
 fn send_pair_request(
@@ -649,6 +806,7 @@ fn send_pair_request(
     code: Option<String>,
     sender_device_id: Option<String>,
     pubkey: Option<String>,
+    dh_pubkey: Option<String>,
     device_name: Option<String>,
     timeout_secs: Option<u64>,
 ) -> Result<(), String> {
@@ -672,6 +830,7 @@ fn send_pair_request(
         .ok_or_else(|| "missing code (use --code or create pairing session)".to_string())?;
     let sender_device_id = sender_device_id.unwrap_or_else(|| identity.device_id.clone());
     let pubkey = pubkey.unwrap_or(identity.public_key);
+    let dh_pubkey = dh_pubkey.or_else(|| identity.dh_public_key.clone());
     let device_name = device_name
         .or_else(|| config.device_name.clone())
         .or_else(|| Some(default_device_name()));
@@ -685,13 +844,14 @@ fn send_pair_request(
         token,
         code,
         pubkey,
+        dh_pubkey,
         device_name,
     };
     let payload =
         serde_json::to_string(&message).map_err(|err| format!("json_error: {}", err))?;
 
     let target = format!("{}:{}", addr, port);
-    let response = send_line_request(
+    let response = send_plain_request(
         &target,
         &payload,
         timeout_secs.unwrap_or(REQUEST_TIMEOUT_SECS),
@@ -703,30 +863,38 @@ fn send_pair_request(
 fn send_ping(
     addr: Option<String>,
     port_override: Option<u16>,
+    device: Option<String>,
+    peer_dh_pubkey: Option<String>,
+    secure: bool,
     device_id: Option<String>,
     timeout_secs: Option<u64>,
 ) -> Result<(), String> {
     let config = load_config_or_default(&paths::config_file())?;
     let identity = Identity::load_or_generate(&paths::identity_file())
         .map_err(|err| format!("identity_load_failed: {}", err))?;
-    let sender_device_id = device_id.unwrap_or(identity.device_id);
+    let sender_device_id = device_id.unwrap_or_else(|| identity.device_id.clone());
     let port = port_override.unwrap_or(config.listen_port);
     let addr = addr.unwrap_or_else(|| "127.0.0.1".to_string());
 
     let message = PingMessage {
         version: 1,
         msg_id: uuid::Uuid::new_v4().to_string(),
-        sender_device_id,
+        sender_device_id: sender_device_id.clone(),
         timestamp_ms: now_ms(),
         msg_type: "PING".to_string(),
     };
     let payload =
         serde_json::to_string(&message).map_err(|err| format!("json_error: {}", err))?;
     let target = format!("{}:{}", addr, port);
-    let response = send_line_request(
+    let peer_dh_pubkey = resolve_peer_dh_pubkey(&config, device, peer_dh_pubkey)?;
+    let response = send_control_request(
         &target,
         &payload,
         timeout_secs.unwrap_or(REQUEST_TIMEOUT_SECS),
+        secure,
+        &identity,
+        &sender_device_id,
+        peer_dh_pubkey,
     )?;
     print_control_response(&response);
     Ok(())
@@ -735,6 +903,9 @@ fn send_ping(
 fn send_hello(
     addr: Option<String>,
     port_override: Option<u16>,
+    device: Option<String>,
+    peer_dh_pubkey: Option<String>,
+    secure: bool,
     device_id: Option<String>,
     device_name: Option<String>,
     capabilities: Option<Vec<String>>,
@@ -743,7 +914,7 @@ fn send_hello(
     let config = load_config_or_default(&paths::config_file())?;
     let identity = Identity::load_or_generate(&paths::identity_file())
         .map_err(|err| format!("identity_load_failed: {}", err))?;
-    let sender_device_id = device_id.unwrap_or(identity.device_id);
+    let sender_device_id = device_id.unwrap_or_else(|| identity.device_id.clone());
     let port = port_override.unwrap_or(config.listen_port);
     let addr = addr.unwrap_or_else(|| "127.0.0.1".to_string());
     let device_name = device_name
@@ -754,7 +925,7 @@ fn send_hello(
     let message = HelloMessage {
         version: 1,
         msg_id: uuid::Uuid::new_v4().to_string(),
-        sender_device_id,
+        sender_device_id: sender_device_id.clone(),
         timestamp_ms: now_ms(),
         msg_type: "HELLO".to_string(),
         device_name,
@@ -763,16 +934,146 @@ fn send_hello(
     let payload =
         serde_json::to_string(&message).map_err(|err| format!("json_error: {}", err))?;
     let target = format!("{}:{}", addr, port);
-    let response = send_line_request(
+    let peer_dh_pubkey = resolve_peer_dh_pubkey(&config, device, peer_dh_pubkey)?;
+    let response = send_control_request(
         &target,
         &payload,
         timeout_secs.unwrap_or(REQUEST_TIMEOUT_SECS),
+        secure,
+        &identity,
+        &sender_device_id,
+        peer_dh_pubkey,
     )?;
     print_control_response(&response);
     Ok(())
 }
 
-fn send_line_request(target: &str, payload: &str, timeout_secs: u64) -> Result<String, String> {
+fn send_daemon_status(
+    addr: Option<String>,
+    port_override: Option<u16>,
+    device: Option<String>,
+    peer_dh_pubkey: Option<String>,
+    secure: bool,
+    include_discovery: bool,
+    timeout_secs: Option<u64>,
+) -> Result<(), String> {
+    let config = load_config_or_default(&paths::config_file())?;
+    let identity = Identity::load_or_generate(&paths::identity_file())
+        .map_err(|err| format!("identity_load_failed: {}", err))?;
+    let sender_device_id = identity.device_id.clone();
+    let port = port_override.unwrap_or(config.listen_port);
+    let addr = addr.unwrap_or_else(|| "127.0.0.1".to_string());
+
+    let message = StatusRequest {
+        version: 1,
+        msg_id: uuid::Uuid::new_v4().to_string(),
+        sender_device_id: sender_device_id.clone(),
+        timestamp_ms: now_ms(),
+        msg_type: "STATUS_REQUEST".to_string(),
+        include_discovery,
+    };
+    let payload =
+        serde_json::to_string(&message).map_err(|err| format!("json_error: {}", err))?;
+    let target = format!("{}:{}", addr, port);
+    let peer_dh_pubkey = resolve_peer_dh_pubkey(&config, device, peer_dh_pubkey)?;
+    let response = send_control_request(
+        &target,
+        &payload,
+        timeout_secs.unwrap_or(REQUEST_TIMEOUT_SECS),
+        secure,
+        &identity,
+        &sender_device_id,
+        peer_dh_pubkey,
+    )?;
+
+    let status: StatusResponse =
+        serde_json::from_str(&response).map_err(|err| format!("json_error: {}", err))?;
+    if status.msg_type != "STATUS_RESPONSE" {
+        println!("{}", response);
+        return Ok(());
+    }
+    for device in status.paired_devices {
+        let name = device.device_name.unwrap_or_else(|| "unknown".to_string());
+        let last_seen = device
+            .last_seen_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        println!("paired\t{}\t{}\t{}", device.device_id, name, last_seen);
+    }
+    if let Some(available) = status.available_devices {
+        if available.is_empty() {
+            println!("available_devices: none");
+        } else {
+            for device in available {
+                let name = device.device_name.unwrap_or_else(|| "unknown".to_string());
+                let addr = if device.addresses.is_empty() {
+                    "-".to_string()
+                } else {
+                    device.addresses.join(",")
+                };
+                let caps = if device.capabilities.is_empty() {
+                    "-".to_string()
+                } else {
+                    device.capabilities.join(",")
+                };
+                println!(
+                    "available\t{}\t{}\t{}\t{}:{}\t{}",
+                    device.device_id, name, device.last_seen_ms, addr, device.port, caps
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn send_control_request(
+    target: &str,
+    payload: &str,
+    timeout_secs: u64,
+    secure: bool,
+    identity: &Identity,
+    sender_device_id: &str,
+    peer_dh_pubkey: Option<String>,
+) -> Result<String, String> {
+    if secure {
+        let peer_dh_pubkey = peer_dh_pubkey.ok_or_else(|| {
+            "missing peer dh pubkey (use --device or --peer-dh-pubkey)".to_string()
+        })?;
+        send_secure_request(
+            target,
+            payload,
+            timeout_secs,
+            identity,
+            sender_device_id,
+            &peer_dh_pubkey,
+        )
+    } else {
+        send_plain_request(target, payload, timeout_secs)
+    }
+}
+
+fn resolve_peer_dh_pubkey(
+    config: &Config,
+    device: Option<String>,
+    peer_dh_pubkey: Option<String>,
+) -> Result<Option<String>, String> {
+    if let Some(value) = peer_dh_pubkey {
+        return Ok(Some(value));
+    }
+    let Some(device_id) = device else {
+        return Ok(None);
+    };
+    let Some(device) = config
+        .paired_devices
+        .iter()
+        .find(|entry| entry.device_id == device_id)
+    else {
+        return Err(format!("device_not_paired: {}", device_id));
+    };
+    Ok(device.dh_pubkey.clone())
+}
+
+fn send_plain_request(target: &str, payload: &str, timeout_secs: u64) -> Result<String, String> {
     let mut stream = TcpStream::connect(target).map_err(|err| format!("connect_failed: {}", err))?;
     let timeout = Duration::from_secs(timeout_secs);
     stream
@@ -781,19 +1082,164 @@ fn send_line_request(target: &str, payload: &str, timeout_secs: u64) -> Result<S
     stream
         .set_write_timeout(Some(timeout))
         .map_err(|err| format!("timeout_failed: {}", err))?;
-    stream
-        .write_all(payload.as_bytes())
-        .map_err(|err| format!("write_failed: {}", err))?;
-    stream
-        .write_all(b"\n")
-        .map_err(|err| format!("write_failed: {}", err))?;
-
-    let mut response = String::new();
-    let mut reader = BufReader::new(stream);
-    reader
-        .read_line(&mut response)
-        .map_err(|err| format!("read_failed: {}", err))?;
+    write_frame(&mut stream, payload.as_bytes())?;
+    let response = read_frame(&mut stream)?;
+    let response =
+        String::from_utf8(response).map_err(|err| format!("utf8_error: {}", err))?;
     Ok(response.trim().to_string())
+}
+
+fn send_secure_request(
+    target: &str,
+    payload: &str,
+    timeout_secs: u64,
+    identity: &Identity,
+    sender_device_id: &str,
+    peer_dh_pubkey: &str,
+) -> Result<String, String> {
+    let dh_secret = identity
+        .dh_secret_key_bytes()
+        .map_err(|err| format!("dh_key_error: {}", err))?;
+    let peer_dh_pubkey = decode_key(peer_dh_pubkey, "peer dh pubkey")?;
+
+    let params: snow::params::NoiseParams = NOISE_PARAMS
+        .parse()
+        .map_err(|err| format!("noise_params_error: {}", err))?;
+    let builder = Builder::new(params)
+        .local_private_key(&dh_secret)
+        .remote_public_key(&peer_dh_pubkey);
+    let mut noise = builder
+        .build_initiator()
+        .map_err(|err| format!("noise_init_error: {}", err))?;
+
+    let mut stream = TcpStream::connect(target).map_err(|err| format!("connect_failed: {}", err))?;
+    let timeout = Duration::from_secs(timeout_secs);
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|err| format!("timeout_failed: {}", err))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|err| format!("timeout_failed: {}", err))?;
+
+    let mut handshake_out = vec![0u8; MAX_FRAME_SIZE];
+    let len = noise
+        .write_message(&[], &mut handshake_out)
+        .map_err(|err| format!("noise_write_failed: {}", err))?;
+    let init = SecureInit {
+        version: 1,
+        msg_id: uuid::Uuid::new_v4().to_string(),
+        sender_device_id: sender_device_id.to_string(),
+        timestamp_ms: now_ms(),
+        msg_type: "SECURE_INIT".to_string(),
+        payload: STANDARD.encode(&handshake_out[..len]),
+    };
+    let init_json =
+        serde_json::to_string(&init).map_err(|err| format!("json_error: {}", err))?;
+    write_frame(&mut stream, init_json.as_bytes())?;
+
+    let response_raw = read_frame(&mut stream)?;
+    let response_str =
+        String::from_utf8(response_raw).map_err(|err| format!("utf8_error: {}", err))?;
+    let base: ResponseBase =
+        serde_json::from_str(&response_str).map_err(|err| format!("json_error: {}", err))?;
+    match base.msg_type.as_str() {
+        "SECURE_ACCEPT" => {
+            let accept: SecureAccept = serde_json::from_str(&response_str)
+                .map_err(|err| format!("json_error: {}", err))?;
+            let _ = accept.msg_type.as_str();
+            let payload =
+                STANDARD.decode(accept.payload).map_err(|err| format!("b64_error: {}", err))?;
+            let mut handshake_in = vec![0u8; MAX_FRAME_SIZE];
+            noise
+                .read_message(&payload, &mut handshake_in)
+                .map_err(|err| format!("noise_read_failed: {}", err))?;
+        }
+        "SECURE_REJECT" => {
+            let reject: SecureReject = serde_json::from_str(&response_str)
+                .map_err(|err| format!("json_error: {}", err))?;
+            let _ = reject.msg_type.as_str();
+            return Err(format!("secure_reject: {}", reject.reason));
+        }
+        _ => return Err("secure_invalid_response".to_string()),
+    }
+
+    let mut transport = noise
+        .into_transport_mode()
+        .map_err(|err| format!("noise_transport_failed: {}", err))?;
+    let mut cipher = vec![0u8; payload.len() + 64];
+    let len = transport
+        .write_message(payload.as_bytes(), &mut cipher)
+        .map_err(|err| format!("noise_encrypt_failed: {}", err))?;
+    let packet = SecurePacket {
+        version: 1,
+        msg_id: uuid::Uuid::new_v4().to_string(),
+        sender_device_id: sender_device_id.to_string(),
+        timestamp_ms: now_ms(),
+        msg_type: "SECURE_PACKET".to_string(),
+        payload: STANDARD.encode(&cipher[..len]),
+    };
+    let packet_json =
+        serde_json::to_string(&packet).map_err(|err| format!("json_error: {}", err))?;
+    write_frame(&mut stream, packet_json.as_bytes())?;
+
+    let response_raw = read_frame(&mut stream)?;
+    let response_str =
+        String::from_utf8(response_raw).map_err(|err| format!("utf8_error: {}", err))?;
+    let packet: SecurePacket =
+        serde_json::from_str(&response_str).map_err(|err| format!("json_error: {}", err))?;
+    if packet.msg_type != "SECURE_PACKET" {
+        return Err("secure_invalid_packet".to_string());
+    }
+    let payload = STANDARD
+        .decode(packet.payload)
+        .map_err(|err| format!("b64_error: {}", err))?;
+    let mut plain = vec![0u8; payload.len() + 64];
+    let len = transport
+        .read_message(&payload, &mut plain)
+        .map_err(|err| format!("noise_decrypt_failed: {}", err))?;
+    let response =
+        String::from_utf8(plain[..len].to_vec()).map_err(|err| format!("utf8_error: {}", err))?;
+    Ok(response.trim().to_string())
+}
+
+fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> Result<(), String> {
+    if payload.len() > MAX_FRAME_SIZE {
+        return Err("frame_too_large".to_string());
+    }
+    let len = payload.len() as u32;
+    stream
+        .write_all(&len.to_be_bytes())
+        .map_err(|err| format!("write_failed: {}", err))?;
+    stream
+        .write_all(payload)
+        .map_err(|err| format!("write_failed: {}", err))?;
+    Ok(())
+}
+
+fn read_frame(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
+    let mut len_buf = [0u8; 4];
+    stream
+        .read_exact(&mut len_buf)
+        .map_err(|err| format!("read_failed: {}", err))?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_FRAME_SIZE {
+        return Err("frame_too_large".to_string());
+    }
+    let mut buf = vec![0u8; len];
+    stream
+        .read_exact(&mut buf)
+        .map_err(|err| format!("read_failed: {}", err))?;
+    Ok(buf)
+}
+
+fn decode_key(value: &str, label: &str) -> Result<[u8; 32], String> {
+    let bytes = STANDARD
+        .decode(value)
+        .map_err(|err| format!("{} decode error: {}", label, err))?;
+    let array: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| format!("{} length invalid", label))?;
+    Ok(array)
 }
 
 fn print_control_response(response: &str) {
@@ -818,6 +1264,8 @@ fn default_capabilities() -> Vec<String> {
 
 const REQUEST_TIMEOUT_SECS: u64 = 10;
 const DISCOVERY_TTL_MS: u64 = 300_000;
+const MAX_FRAME_SIZE: usize = 1_048_576;
+const NOISE_PARAMS: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 
 fn print_identity(identity_path: PathBuf, create_if_missing: bool) {
     if create_if_missing {
@@ -825,6 +1273,9 @@ fn print_identity(identity_path: PathBuf, create_if_missing: bool) {
             Ok(identity) => {
                 println!("device_id: {}", identity.device_id);
                 println!("public_key: {}", identity.public_key);
+                if let Some(dh_public_key) = identity.dh_public_key {
+                    println!("dh_public_key: {}", dh_public_key);
+                }
             }
             Err(err) => {
                 eprintln!("identity_error: {}", err);
@@ -837,6 +1288,9 @@ fn print_identity(identity_path: PathBuf, create_if_missing: bool) {
         Ok(Some(identity)) => {
             println!("device_id: {}", identity.device_id);
             println!("public_key: {}", identity.public_key);
+            if let Some(dh_public_key) = identity.dh_public_key {
+                println!("dh_public_key: {}", dh_public_key);
+            }
         }
         Ok(None) => {
             println!("identity_status: missing");

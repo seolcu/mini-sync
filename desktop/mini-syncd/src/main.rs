@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::Parser;
 use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
 use mini_sync_common::{
@@ -8,10 +9,11 @@ use mini_sync_common::{
     paths,
 };
 use serde::{Deserialize, Serialize};
+use snow::Builder;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::thread;
@@ -42,6 +44,7 @@ struct PairRequest {
     token: String,
     code: String,
     pubkey: String,
+    dh_pubkey: Option<String>,
     device_name: Option<String>,
 }
 
@@ -63,6 +66,16 @@ struct HelloRequest {
     msg_type: String,
     device_name: String,
     capabilities: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct StatusRequest {
+    version: u8,
+    msg_id: String,
+    sender_device_id: String,
+    timestamp_ms: u64,
+    msg_type: String,
+    include_discovery: bool,
 }
 
 #[derive(Serialize)]
@@ -96,11 +109,86 @@ struct Pong {
 }
 
 #[derive(Serialize)]
+struct StatusResponse {
+    version: u8,
+    msg_id: String,
+    sender_device_id: String,
+    timestamp_ms: u64,
+    msg_type: String,
+    paired_devices: Vec<StatusPairedDevice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    available_devices: Option<Vec<StatusAvailableDevice>>,
+}
+
+#[derive(Serialize)]
+struct StatusPairedDevice {
+    device_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_seen_ms: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct StatusAvailableDevice {
+    device_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_name: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    capabilities: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    addresses: Vec<String>,
+    port: u16,
+    last_seen_ms: u64,
+}
+
+#[derive(Deserialize)]
+struct SecureInit {
+    version: u8,
+    msg_id: String,
+    sender_device_id: String,
+    timestamp_ms: u64,
+    msg_type: String,
+    payload: String,
+}
+
+#[derive(Serialize)]
+struct SecureAccept {
+    version: u8,
+    msg_id: String,
+    sender_device_id: String,
+    timestamp_ms: u64,
+    msg_type: String,
+    payload: String,
+}
+
+#[derive(Serialize)]
+struct SecureReject {
+    version: u8,
+    msg_id: String,
+    sender_device_id: String,
+    timestamp_ms: u64,
+    msg_type: String,
+    reason: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SecurePacket {
+    version: u8,
+    msg_id: String,
+    sender_device_id: String,
+    timestamp_ms: u64,
+    msg_type: String,
+    payload: String,
+}
+
+#[derive(Serialize)]
 #[serde(untagged)]
 enum ControlResponse {
     Accept(PairAccept),
     Reject(PairReject),
     Pong(Pong),
+    Status(StatusResponse),
 }
 
 fn main() {
@@ -225,28 +313,25 @@ fn handle_pairing_stream(
     stream
         .set_read_timeout(Some(Duration::from_secs(PAIRING_READ_TIMEOUT_SECS)))
         .map_err(|err| format!("pairing_timeout_failed: {}", err))?;
-    let mut raw = String::new();
-    let mut reader = BufReader::new(
-        stream
-            .try_clone()
-            .map_err(|err| format!("pairing_stream_clone_failed: {}", err))?,
-    );
-    reader
-        .read_line(&mut raw)
-        .map_err(|err| format!("pairing_read_failed: {}", err))?;
+    let raw = read_frame(&mut stream)?;
+    let raw = String::from_utf8(raw).map_err(|err| format!("pairing_utf8_failed: {}", err))?;
     let raw = raw.trim();
     if raw.is_empty() {
         return Err("pairing_empty_request".to_string());
     }
 
+    let base: BaseMessage =
+        serde_json::from_str(raw).map_err(|_| "pairing_invalid_json".to_string())?;
+    if base.msg_type == "SECURE_INIT" {
+        let init: SecureInit =
+            serde_json::from_str(raw).map_err(|_| "pairing_invalid_request".to_string())?;
+        return handle_secure_session(init, &mut stream, identity, config_path, pairing_path);
+    }
+
     let response = handle_control_message(raw, identity, config_path, pairing_path);
     let response_json =
         serde_json::to_string(&response).map_err(|err| format!("pairing_json_failed: {}", err))?;
-    stream
-        .write_all(response_json.as_bytes())
-        .map_err(|err| format!("pairing_write_failed: {}", err))?;
-    stream
-        .write_all(b"\n")
+    write_frame(&mut stream, response_json.as_bytes())
         .map_err(|err| format!("pairing_write_failed: {}", err))?;
     Ok(())
 }
@@ -282,6 +367,13 @@ fn handle_control_message(
                 Err(_) => return reject(identity, "invalid_request"),
             };
             handle_hello_request(request, identity, config_path)
+        }
+        "STATUS_REQUEST" => {
+            let request: StatusRequest = match serde_json::from_str(raw) {
+                Ok(request) => request,
+                Err(_) => return reject(identity, "invalid_request"),
+            };
+            handle_status_request(request, identity, config_path)
         }
         _ => reject(identity, "unsupported_msg_type"),
     }
@@ -326,6 +418,7 @@ fn handle_pair_request(
         config_path,
         &request.sender_device_id,
         &request.pubkey,
+        request.dh_pubkey.as_deref(),
         request.device_name.as_deref(),
         now,
     ) {
@@ -388,6 +481,206 @@ fn handle_hello_request(
         Ok(false) => reject(identity, "unpaired_device"),
         Err(err) => reject(identity, &format!("config_error: {}", err)),
     }
+}
+
+fn handle_status_request(
+    request: StatusRequest,
+    identity: &Identity,
+    config_path: &Path,
+) -> ControlResponse {
+    let _ = request.msg_id.as_str();
+    let _ = request.timestamp_ms;
+    if request.msg_type != "STATUS_REQUEST" {
+        return reject(identity, "invalid_msg_type");
+    }
+    if request.version != 1 {
+        return reject(identity, "unsupported_version");
+    }
+    let now = now_ms();
+    let _ = update_paired_device(
+        config_path,
+        &request.sender_device_id,
+        None,
+        now,
+    );
+
+    let config = match load_config_or_default(config_path) {
+        Ok(config) => config,
+        Err(err) => return reject(identity, &format!("config_error: {}", err)),
+    };
+    let paired_devices = config
+        .paired_devices
+        .into_iter()
+        .map(|device| StatusPairedDevice {
+            device_id: device.device_id,
+            device_name: device.device_name,
+            last_seen_ms: device.last_seen_ms,
+        })
+        .collect::<Vec<_>>();
+
+    let available_devices = if request.include_discovery {
+        match DiscoveryState::load_optional(&paths::discovery_file()) {
+            Ok(Some(mut state)) => {
+                state.prune_expired(now, DISCOVERY_TTL_MS);
+                Some(
+                    state
+                        .devices
+                        .into_iter()
+                        .map(|device| StatusAvailableDevice {
+                            device_id: device.device_id,
+                            device_name: device.device_name,
+                            capabilities: device.capabilities,
+                            addresses: device.addresses,
+                            port: device.port,
+                            last_seen_ms: device.last_seen_ms,
+                        })
+                        .collect(),
+                )
+            }
+            Ok(None) => Some(Vec::new()),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    ControlResponse::Status(StatusResponse {
+        version: 1,
+        msg_id: new_msg_id(),
+        sender_device_id: identity.device_id.clone(),
+        timestamp_ms: now_ms(),
+        msg_type: "STATUS_RESPONSE".to_string(),
+        paired_devices,
+        available_devices,
+    })
+}
+
+fn handle_secure_session(
+    init: SecureInit,
+    stream: &mut TcpStream,
+    identity: &Identity,
+    config_path: &Path,
+    pairing_path: &Path,
+) -> Result<(), String> {
+    let _ = init.msg_id.as_str();
+    let _ = init.timestamp_ms;
+    if init.msg_type != "SECURE_INIT" {
+        return Err("secure_invalid_msg_type".to_string());
+    }
+    if init.version != 1 {
+        return send_secure_reject(stream, identity, "unsupported_version");
+    }
+    let config = load_config_or_default(config_path)?;
+    let peer = match config
+        .paired_devices
+        .iter()
+        .find(|device| device.device_id == init.sender_device_id)
+    {
+        Some(peer) => peer,
+        None => return send_secure_reject(stream, identity, "unpaired_device"),
+    };
+    let Some(peer_dh_pubkey) = peer.dh_pubkey.as_deref() else {
+        return send_secure_reject(stream, identity, "missing_peer_dh_key");
+    };
+    let dh_secret = match identity.dh_secret_key_bytes() {
+        Ok(value) => value,
+        Err(err) => return send_secure_reject(stream, identity, &format!("dh_key_error: {}", err)),
+    };
+    let peer_dh_pubkey = match decode_key(peer_dh_pubkey, "peer dh pubkey") {
+        Ok(value) => value,
+        Err(err) => return send_secure_reject(stream, identity, &err),
+    };
+
+    let params: snow::params::NoiseParams = NOISE_PARAMS
+        .parse()
+        .map_err(|err| format!("noise_params_error: {}", err))?;
+    let builder = Builder::new(params)
+        .local_private_key(&dh_secret)
+        .remote_public_key(&peer_dh_pubkey);
+    let mut noise = builder
+        .build_responder()
+        .map_err(|err| format!("noise_init_error: {}", err))?;
+
+    let payload =
+        STANDARD.decode(init.payload).map_err(|err| format!("b64_error: {}", err))?;
+    let mut handshake_in = vec![0u8; MAX_FRAME_SIZE];
+    noise
+        .read_message(&payload, &mut handshake_in)
+        .map_err(|err| format!("noise_read_failed: {}", err))?;
+
+    let mut handshake_out = vec![0u8; MAX_FRAME_SIZE];
+    let len = noise
+        .write_message(&[], &mut handshake_out)
+        .map_err(|err| format!("noise_write_failed: {}", err))?;
+    let accept = SecureAccept {
+        version: 1,
+        msg_id: new_msg_id(),
+        sender_device_id: identity.device_id.clone(),
+        timestamp_ms: now_ms(),
+        msg_type: "SECURE_ACCEPT".to_string(),
+        payload: STANDARD.encode(&handshake_out[..len]),
+    };
+    let accept_json =
+        serde_json::to_string(&accept).map_err(|err| format!("json_error: {}", err))?;
+    write_frame(stream, accept_json.as_bytes())?;
+
+    let mut transport = noise
+        .into_transport_mode()
+        .map_err(|err| format!("noise_transport_failed: {}", err))?;
+    let raw = read_frame(stream)?;
+    let raw = String::from_utf8(raw).map_err(|err| format!("utf8_error: {}", err))?;
+    let packet: SecurePacket =
+        serde_json::from_str(&raw).map_err(|err| format!("json_error: {}", err))?;
+    if packet.msg_type != "SECURE_PACKET" {
+        return Err("secure_invalid_packet".to_string());
+    }
+    let payload =
+        STANDARD.decode(packet.payload).map_err(|err| format!("b64_error: {}", err))?;
+    let mut plain = vec![0u8; payload.len() + 64];
+    let len = transport
+        .read_message(&payload, &mut plain)
+        .map_err(|err| format!("noise_decrypt_failed: {}", err))?;
+    let plaintext =
+        String::from_utf8(plain[..len].to_vec()).map_err(|err| format!("utf8_error: {}", err))?;
+
+    let response = handle_control_message(&plaintext, identity, config_path, pairing_path);
+    let response_json =
+        serde_json::to_string(&response).map_err(|err| format!("json_error: {}", err))?;
+    let mut cipher = vec![0u8; response_json.len() + 64];
+    let len = transport
+        .write_message(response_json.as_bytes(), &mut cipher)
+        .map_err(|err| format!("noise_encrypt_failed: {}", err))?;
+    let response_packet = SecurePacket {
+        version: 1,
+        msg_id: new_msg_id(),
+        sender_device_id: identity.device_id.clone(),
+        timestamp_ms: now_ms(),
+        msg_type: "SECURE_PACKET".to_string(),
+        payload: STANDARD.encode(&cipher[..len]),
+    };
+    let response_packet_json = serde_json::to_string(&response_packet)
+        .map_err(|err| format!("json_error: {}", err))?;
+    write_frame(stream, response_packet_json.as_bytes())?;
+    Ok(())
+}
+
+fn send_secure_reject(
+    stream: &mut TcpStream,
+    identity: &Identity,
+    reason: &str,
+) -> Result<(), String> {
+    let reject = SecureReject {
+        version: 1,
+        msg_id: new_msg_id(),
+        sender_device_id: identity.device_id.clone(),
+        timestamp_ms: now_ms(),
+        msg_type: "SECURE_REJECT".to_string(),
+        reason: reason.to_string(),
+    };
+    let reject_json =
+        serde_json::to_string(&reject).map_err(|err| format!("json_error: {}", err))?;
+    write_frame(stream, reject_json.as_bytes())?;
+    Err(format!("secure_reject: {}", reason))
 }
 
 fn accept(identity: &Identity, code_confirm: String) -> ControlResponse {
@@ -579,6 +872,7 @@ fn upsert_paired_device(
     config_path: &Path,
     device_id: &str,
     pubkey: &str,
+    dh_pubkey: Option<&str>,
     device_name: Option<&str>,
     last_seen_ms: u64,
 ) -> Result<(), String> {
@@ -589,6 +883,9 @@ fn upsert_paired_device(
         .find(|device| device.device_id == device_id)
     {
         existing.pubkey = pubkey.to_string();
+        if let Some(dh_pubkey) = dh_pubkey {
+            existing.dh_pubkey = Some(dh_pubkey.to_string());
+        }
         if let Some(name) = device_name {
             existing.device_name = Some(name.to_string());
         }
@@ -598,6 +895,7 @@ fn upsert_paired_device(
             device_id: device_id.to_string(),
             device_name: device_name.map(|name| name.to_string()),
             pubkey: pubkey.to_string(),
+            dh_pubkey: dh_pubkey.map(|value| value.to_string()),
             last_seen_ms: Some(last_seen_ms),
         });
     }
@@ -639,6 +937,46 @@ fn load_config_or_default(config_path: &Path) -> Result<Config, String> {
     }
 }
 
+fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> Result<(), String> {
+    if payload.len() > MAX_FRAME_SIZE {
+        return Err("frame_too_large".to_string());
+    }
+    let len = payload.len() as u32;
+    stream
+        .write_all(&len.to_be_bytes())
+        .map_err(|err| format!("write_failed: {}", err))?;
+    stream
+        .write_all(payload)
+        .map_err(|err| format!("write_failed: {}", err))?;
+    Ok(())
+}
+
+fn read_frame(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
+    let mut len_buf = [0u8; 4];
+    stream
+        .read_exact(&mut len_buf)
+        .map_err(|err| format!("read_failed: {}", err))?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_FRAME_SIZE {
+        return Err("frame_too_large".to_string());
+    }
+    let mut buf = vec![0u8; len];
+    stream
+        .read_exact(&mut buf)
+        .map_err(|err| format!("read_failed: {}", err))?;
+    Ok(buf)
+}
+
+fn decode_key(value: &str, label: &str) -> Result<[u8; 32], String> {
+    let bytes = STANDARD
+        .decode(value)
+        .map_err(|err| format!("{} decode error: {}", label, err))?;
+    let array: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| format!("{} length invalid", label))?;
+    Ok(array)
+}
+
 fn short_device_id(device_id: &str) -> String {
     device_id
         .split('-')
@@ -663,3 +1001,5 @@ fn now_ms() -> u64 {
 
 const PAIRING_READ_TIMEOUT_SECS: u64 = 10;
 const DISCOVERY_TTL_MS: u64 = 300_000;
+const MAX_FRAME_SIZE: usize = 1_048_576;
+const NOISE_PARAMS: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
