@@ -18,6 +18,7 @@ Status: skeleton (M0). CLI/daemon stubs only.
 ## Quick start (desktop)
 - `cargo run -p mini-sync -- --help`
 - `cargo run -p mini-syncd -- --version`
+- Manual device entry (stub): `mini-sync pair --device-id <id> --pubkey <key> [--name <name>]`
 
 ## Notes
 - Wayland clipboard via `wl-clipboard` is planned
