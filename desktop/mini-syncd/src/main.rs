@@ -1,8 +1,9 @@
 use clap::Parser;
 use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
-use mini_sync_common::{config::Config, identity::Identity, paths};
+use mini_sync_common::{config::Config, identity::Identity, pairing::PairingSession, paths};
 use std::collections::HashMap;
 use std::env;
+use std::fs;
 
 #[derive(Parser)]
 #[command(name = "mini-syncd", version, about = "mini-sync daemon")]
@@ -42,6 +43,7 @@ fn main() {
     };
     println!("device_id: {}", identity.device_id);
     println!("public_key: {}", identity.public_key);
+    print_pairing_status();
 
     let device_name = args
         .device_name
@@ -57,6 +59,31 @@ fn main() {
     if let Err(err) = run_mdns(&identity, &device_name, config.listen_port) {
         eprintln!("mdns_error: {}", err);
         std::process::exit(1);
+    }
+}
+
+fn print_pairing_status() {
+    let pairing_path = paths::pairing_file();
+    println!("pairing_path: {}", pairing_path.display());
+    match PairingSession::load_optional(&pairing_path) {
+        Ok(Some(session)) => {
+            let now = now_ms();
+            if session.is_expired(now) {
+                if let Err(err) = fs::remove_file(&pairing_path) {
+                    eprintln!("pairing_cleanup_error: {}", err);
+                }
+                println!("pairing_status: expired");
+            } else {
+                println!("pairing_status: active");
+                println!("pairing_expires_at_ms: {}", session.expires_at_ms);
+            }
+        }
+        Ok(None) => {
+            println!("pairing_status: none");
+        }
+        Err(err) => {
+            eprintln!("pairing_error: {}", err);
+        }
     }
 }
 
@@ -147,4 +174,12 @@ fn default_device_name() -> String {
     env::var("MINI_SYNC_DEVICE_NAME")
         .or_else(|_| env::var("HOSTNAME"))
         .unwrap_or_else(|_| "mini-sync".to_string())
+}
+
+fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis() as u64)
+        .unwrap_or(0)
 }

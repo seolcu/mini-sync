@@ -22,6 +22,7 @@ Status: skeleton (M0). CLI/daemon stubs only.
 - Generate/load local identity: `mini-sync status` (writes `~/.local/state/mini-sync/identity.toml`)
 - Pairing QR payload (stub): `mini-sync pair` (use `--addr <ip>` / `--port <port>` as needed)
 - mDNS advertise/browse (daemon): `mini-syncd` (prints discovered services)
+- Pairing session is stored at `~/.local/state/mini-sync/pairing.toml` (use `--no-store` to skip)
 
 ## Notes
 - Wayland clipboard via `wl-clipboard` is planned

@@ -21,6 +21,10 @@ pub fn identity_file() -> PathBuf {
     state_dir().join("identity.toml")
 }
 
+pub fn pairing_file() -> PathBuf {
+    state_dir().join("pairing.toml")
+}
+
 pub fn default_download_dir() -> PathBuf {
     if let Some(home) = home_dir() {
         home.join("Downloads").join("mini-sync")

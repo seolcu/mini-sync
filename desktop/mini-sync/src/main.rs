@@ -2,11 +2,11 @@ use clap::{Parser, Subcommand};
 use mini_sync_common::{
     config::{Config, PairedDevice},
     identity::Identity,
+    pairing::PairingSession,
     paths,
 };
 use qrcode::QrCode;
 use rand::RngCore;
-use serde::Serialize;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -42,6 +42,8 @@ enum Command {
         json: bool,
         #[arg(long)]
         no_qr: bool,
+        #[arg(long)]
+        no_store: bool,
     },
     Unpair {
         device: String,
@@ -80,6 +82,7 @@ fn main() {
             device_name,
             json,
             no_qr,
+            no_store,
         } => {
             if let Some(device_id) = device_id {
                 if let Err(err) = upsert_device(
@@ -93,12 +96,12 @@ fn main() {
                     std::process::exit(1);
                 }
             } else if let Err(err) =
-                print_pairing_payload(addr, port, device_name, json, no_qr)
+                print_pairing_payload(addr, port, device_name, json, no_qr, no_store)
             {
                 eprintln!("pair_error: {}", err);
                 std::process::exit(1);
+            }
         }
-    }
         Command::Unpair { device } => {
             if let Err(err) = remove_device(&device, &paths::config_file()) {
                 eprintln!("unpair_error: {}", err);
@@ -124,28 +127,13 @@ fn main() {
     }
 }
 
-#[derive(Serialize)]
-struct PairingPayload {
-    version: u8,
-    device_id: String,
-    device_name: String,
-    public_key: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    addr: Option<String>,
-    port: u16,
-    token: String,
-    code: String,
-    created_at_ms: u64,
-    expires_at_ms: u64,
-    capabilities: Vec<String>,
-}
-
 fn print_pairing_payload(
     addr: Option<String>,
     port_override: Option<u16>,
     device_name: Option<String>,
     json_only: bool,
     no_qr: bool,
+    no_store: bool,
 ) -> Result<(), String> {
     let identity_path = paths::identity_file();
     let identity = Identity::load_or_generate(&identity_path)
@@ -158,7 +146,7 @@ fn print_pairing_payload(
 
     let created_at_ms = now_ms();
     let expires_at_ms = created_at_ms.saturating_add(PAIR_TOKEN_TTL_MS);
-    let payload = PairingPayload {
+    let payload = PairingSession {
         version: 1,
         device_id: identity.device_id,
         device_name,
@@ -171,6 +159,14 @@ fn print_pairing_payload(
         expires_at_ms,
         capabilities: vec!["clipboard".to_string(), "file".to_string()],
     };
+
+    if !no_store {
+        let pairing_path = paths::pairing_file();
+        payload
+            .save(&pairing_path)
+            .map_err(|err| format!("pairing_save_failed: {}", err))?;
+        println!("pairing_path: {}", pairing_path.display());
+    }
 
     let json_compact =
         serde_json::to_string(&payload).map_err(|err| format!("json_error: {}", err))?;
@@ -288,6 +284,9 @@ fn print_status() {
     let identity_path = paths::identity_file();
     println!("identity_path: {}", identity_path.display());
     print_identity(identity_path, true);
+    let pairing_path = paths::pairing_file();
+    println!("pairing_path: {}", pairing_path.display());
+    print_pairing_status(&pairing_path);
 
     match Config::load_optional(&config_path) {
         Ok(Some(config)) => {
@@ -340,6 +339,7 @@ fn print_config() {
     println!("state_dir: {}", paths::state_dir().display());
     println!("log_dir: {}", paths::log_dir().display());
     println!("identity_path: {}", paths::identity_file().display());
+    println!("pairing_path: {}", paths::pairing_file().display());
 
     match Config::load_optional(&config_path) {
         Ok(Some(config)) => {
@@ -377,6 +377,22 @@ fn load_config_or_default(config_path: &Path) -> Result<Config, String> {
         Ok(Some(config)) => Ok(config),
         Ok(None) => Ok(Config::default()),
         Err(err) => Err(format!("config_load_failed: {}", err)),
+    }
+}
+
+fn print_pairing_status(pairing_path: &Path) {
+    match PairingSession::load_optional(pairing_path) {
+        Ok(Some(session)) => {
+            let now = now_ms();
+            if session.is_expired(now) {
+                println!("pairing_status: expired");
+            } else {
+                println!("pairing_status: active");
+                println!("pairing_expires_at_ms: {}", session.expires_at_ms);
+            }
+        }
+        Ok(None) => println!("pairing_status: none"),
+        Err(err) => eprintln!("pairing_error: {}", err),
     }
 }
 
