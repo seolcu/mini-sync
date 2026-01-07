@@ -1,4 +1,5 @@
 listen_port = 9150
+device_name = "mini-sync"
 download_dir = "/home/USER/Downloads/mini-sync"
 paired_devices = []
 

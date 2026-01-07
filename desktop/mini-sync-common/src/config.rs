@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     #[serde(default = "default_listen_port")]
     pub listen_port: u16,
+    #[serde(default)]
+    pub device_name: Option<String>,
     #[serde(default = "default_download_dir")]
     pub download_dir: PathBuf,
     #[serde(default)]
@@ -43,6 +45,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             listen_port: default_listen_port(),
+            device_name: None,
             download_dir: default_download_dir(),
             clipboard: ClipboardConfig::default(),
             paired_devices: Vec::new(),

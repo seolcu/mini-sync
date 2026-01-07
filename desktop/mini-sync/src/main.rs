@@ -152,7 +152,9 @@ fn print_pairing_payload(
         .map_err(|err| format!("identity_load_failed: {}", err))?;
     let config = load_config_or_default(&paths::config_file())?;
     let port = port_override.unwrap_or(config.listen_port);
-    let device_name = device_name.unwrap_or_else(default_device_name);
+    let device_name = device_name
+        .or_else(|| config.device_name.clone())
+        .unwrap_or_else(default_device_name);
 
     let created_at_ms = now_ms();
     let expires_at_ms = created_at_ms.saturating_add(PAIR_TOKEN_TTL_MS);
@@ -358,6 +360,13 @@ fn print_config() {
 
 fn print_config_summary(config: &Config) {
     println!("listen_port: {}", config.listen_port);
+    println!(
+        "device_name: {}",
+        config
+            .device_name
+            .as_deref()
+            .unwrap_or("unset")
+    );
     println!("download_dir: {}", config.download_dir.display());
     println!("clipboard.watch: {}", config.clipboard.watch);
     println!("paired_devices: {}", config.paired_devices.len());
@@ -379,7 +388,9 @@ fn now_ms() -> u64 {
 }
 
 fn default_device_name() -> String {
-    env::var("HOSTNAME").unwrap_or_else(|_| "mini-sync".to_string())
+    env::var("MINI_SYNC_DEVICE_NAME")
+        .or_else(|_| env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "mini-sync".to_string())
 }
 
 const PAIR_TOKEN_TTL_MS: u64 = 180_000;
