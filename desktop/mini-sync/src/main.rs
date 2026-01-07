@@ -4,7 +4,12 @@ use mini_sync_common::{
     identity::Identity,
     paths,
 };
+use qrcode::QrCode;
+use rand::RngCore;
+use serde::Serialize;
+use std::env;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
 #[command(name = "mini-sync", version, about = "Minimal PC <-> Android sync CLI")]
@@ -27,6 +32,16 @@ enum Command {
         name: Option<String>,
         #[arg(long)]
         last_seen_ms: Option<u64>,
+        #[arg(long)]
+        addr: Option<String>,
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        device_name: Option<String>,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        no_qr: bool,
     },
     Unpair {
         device: String,
@@ -60,6 +75,11 @@ fn main() {
             pubkey,
             name,
             last_seen_ms,
+            addr,
+            port,
+            device_name,
+            json,
+            no_qr,
         } => {
             if let Some(device_id) = device_id {
                 if let Err(err) = upsert_device(
@@ -72,10 +92,13 @@ fn main() {
                     eprintln!("pair_error: {}", err);
                     std::process::exit(1);
                 }
-            } else {
-                print_stub("pair");
-            }
+            } else if let Err(err) =
+                print_pairing_payload(addr, port, device_name, json, no_qr)
+            {
+                eprintln!("pair_error: {}", err);
+                std::process::exit(1);
         }
+    }
         Command::Unpair { device } => {
             if let Err(err) = remove_device(&device, &paths::config_file()) {
                 eprintln!("unpair_error: {}", err);
@@ -101,8 +124,99 @@ fn main() {
     }
 }
 
-fn print_stub(action: &str) {
-    println!("{}: not implemented yet", action);
+#[derive(Serialize)]
+struct PairingPayload {
+    version: u8,
+    device_id: String,
+    device_name: String,
+    public_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    addr: Option<String>,
+    port: u16,
+    token: String,
+    code: String,
+    created_at_ms: u64,
+    expires_at_ms: u64,
+    capabilities: Vec<String>,
+}
+
+fn print_pairing_payload(
+    addr: Option<String>,
+    port_override: Option<u16>,
+    device_name: Option<String>,
+    json_only: bool,
+    no_qr: bool,
+) -> Result<(), String> {
+    let identity_path = paths::identity_file();
+    let identity = Identity::load_or_generate(&identity_path)
+        .map_err(|err| format!("identity_load_failed: {}", err))?;
+    let config = load_config_or_default(&paths::config_file())?;
+    let port = port_override.unwrap_or(config.listen_port);
+    let device_name = device_name.unwrap_or_else(default_device_name);
+
+    let created_at_ms = now_ms();
+    let expires_at_ms = created_at_ms.saturating_add(PAIR_TOKEN_TTL_MS);
+    let payload = PairingPayload {
+        version: 1,
+        device_id: identity.device_id,
+        device_name,
+        public_key: identity.public_key,
+        addr,
+        port,
+        token: random_token(),
+        code: random_code(),
+        created_at_ms,
+        expires_at_ms,
+        capabilities: vec!["clipboard".to_string(), "file".to_string()],
+    };
+
+    let json_compact =
+        serde_json::to_string(&payload).map_err(|err| format!("json_error: {}", err))?;
+    if json_only {
+        println!("{}", json_compact);
+        return Ok(());
+    }
+
+    let json_pretty =
+        serde_json::to_string_pretty(&payload).map_err(|err| format!("json_error: {}", err))?;
+    println!("pair_code: {}", payload.code);
+    println!("pair_token: {}", payload.token);
+    println!("expires_at_ms: {}", payload.expires_at_ms);
+    println!("payload_json:\n{}", json_pretty);
+
+    if !no_qr {
+        println!("qr:");
+        print_qr(&json_compact)?;
+    }
+
+    Ok(())
+}
+
+fn print_qr(data: &str) -> Result<(), String> {
+    let code = QrCode::new(data.as_bytes())
+        .map_err(|err| format!("qr_encode_failed: {}", err))?;
+    let rendered = code
+        .render::<char>()
+        .quiet_zone(true)
+        .module_dimensions(2, 1)
+        .dark_color('#')
+        .light_color(' ')
+        .build();
+    println!("{}", rendered);
+    Ok(())
+}
+
+fn random_token() -> String {
+    let mut bytes = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|byte| format!("{:02x}", byte)).collect()
+}
+
+fn random_code() -> String {
+    let mut bytes = [0u8; 4];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    let value = u32::from_le_bytes(bytes) % 1_000_000;
+    format!("{:06}", value)
 }
 
 fn upsert_device(
@@ -256,6 +370,19 @@ fn load_config_or_default(config_path: &Path) -> Result<Config, String> {
         Err(err) => Err(format!("config_load_failed: {}", err)),
     }
 }
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn default_device_name() -> String {
+    env::var("HOSTNAME").unwrap_or_else(|_| "mini-sync".to_string())
+}
+
+const PAIR_TOKEN_TTL_MS: u64 = 180_000;
 
 fn print_identity(identity_path: PathBuf, create_if_missing: bool) {
     if create_if_missing {
