@@ -7,7 +7,7 @@ use mini_sync_common::{
 };
 use qrcode::QrCode;
 use rand::RngCore;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
@@ -63,6 +63,30 @@ enum Command {
         pubkey: Option<String>,
         #[arg(long)]
         device_name: Option<String>,
+        #[arg(long)]
+        timeout_secs: Option<u64>,
+    },
+    Ping {
+        #[arg(long)]
+        addr: Option<String>,
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        device_id: Option<String>,
+        #[arg(long)]
+        timeout_secs: Option<u64>,
+    },
+    Hello {
+        #[arg(long)]
+        addr: Option<String>,
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        device_id: Option<String>,
+        #[arg(long)]
+        device_name: Option<String>,
+        #[arg(long, value_delimiter = ',')]
+        capabilities: Option<Vec<String>>,
         #[arg(long)]
         timeout_secs: Option<u64>,
     },
@@ -144,6 +168,37 @@ fn main() {
                 timeout_secs,
             ) {
                 eprintln!("pair_request_error: {}", err);
+                std::process::exit(1);
+            }
+        }
+        Command::Ping {
+            addr,
+            port,
+            device_id,
+            timeout_secs,
+        } => {
+            if let Err(err) = send_ping(addr, port, device_id, timeout_secs) {
+                eprintln!("ping_error: {}", err);
+                std::process::exit(1);
+            }
+        }
+        Command::Hello {
+            addr,
+            port,
+            device_id,
+            device_name,
+            capabilities,
+            timeout_secs,
+        } => {
+            if let Err(err) = send_hello(
+                addr,
+                port,
+                device_id,
+                device_name,
+                capabilities,
+                timeout_secs,
+            ) {
+                eprintln!("hello_error: {}", err);
                 std::process::exit(1);
             }
         }
@@ -470,6 +525,32 @@ struct PairRequestMessage {
     device_name: Option<String>,
 }
 
+#[derive(Serialize)]
+struct PingMessage {
+    version: u8,
+    msg_id: String,
+    sender_device_id: String,
+    timestamp_ms: u64,
+    msg_type: String,
+}
+
+#[derive(Serialize)]
+struct HelloMessage {
+    version: u8,
+    msg_id: String,
+    sender_device_id: String,
+    timestamp_ms: u64,
+    msg_type: String,
+    device_name: String,
+    capabilities: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct ResponseBase {
+    msg_type: String,
+    reason: Option<String>,
+}
+
 fn send_pair_request(
     addr: Option<String>,
     port_override: Option<u16>,
@@ -483,6 +564,8 @@ fn send_pair_request(
     let config = load_config_or_default(&paths::config_file())?;
     let pairing = PairingSession::load_optional(&paths::pairing_file())
         .map_err(|err| format!("pairing_load_failed: {}", err))?;
+    let identity = Identity::load_or_generate(&paths::identity_file())
+        .map_err(|err| format!("identity_load_failed: {}", err))?;
 
     let port = port_override
         .or_else(|| pairing.as_ref().map(|session| session.port))
@@ -496,14 +579,11 @@ fn send_pair_request(
     let code = code
         .or_else(|| pairing.as_ref().map(|session| session.code.clone()))
         .ok_or_else(|| "missing code (use --code or create pairing session)".to_string())?;
-    let sender_device_id =
-        sender_device_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let pubkey = pubkey.unwrap_or_else(|| {
-        Identity::load_or_generate(&paths::identity_file())
-            .map(|identity| identity.public_key)
-            .unwrap_or_else(|_| "test-key".to_string())
-    });
-    let device_name = device_name.or_else(|| Some("mini-sync-cli".to_string()));
+    let sender_device_id = sender_device_id.unwrap_or_else(|| identity.device_id.clone());
+    let pubkey = pubkey.unwrap_or(identity.public_key);
+    let device_name = device_name
+        .or_else(|| config.device_name.clone())
+        .or_else(|| Some(default_device_name()));
 
     let message = PairRequestMessage {
         version: 1,
@@ -520,9 +600,90 @@ fn send_pair_request(
         serde_json::to_string(&message).map_err(|err| format!("json_error: {}", err))?;
 
     let target = format!("{}:{}", addr, port);
-    let mut stream =
-        TcpStream::connect(&target).map_err(|err| format!("connect_failed: {}", err))?;
-    let timeout = Duration::from_secs(timeout_secs.unwrap_or(PAIR_REQUEST_TIMEOUT_SECS));
+    let response = send_line_request(
+        &target,
+        &payload,
+        timeout_secs.unwrap_or(REQUEST_TIMEOUT_SECS),
+    )?;
+    println!("{}", response);
+    Ok(())
+}
+
+fn send_ping(
+    addr: Option<String>,
+    port_override: Option<u16>,
+    device_id: Option<String>,
+    timeout_secs: Option<u64>,
+) -> Result<(), String> {
+    let config = load_config_or_default(&paths::config_file())?;
+    let identity = Identity::load_or_generate(&paths::identity_file())
+        .map_err(|err| format!("identity_load_failed: {}", err))?;
+    let sender_device_id = device_id.unwrap_or(identity.device_id);
+    let port = port_override.unwrap_or(config.listen_port);
+    let addr = addr.unwrap_or_else(|| "127.0.0.1".to_string());
+
+    let message = PingMessage {
+        version: 1,
+        msg_id: uuid::Uuid::new_v4().to_string(),
+        sender_device_id,
+        timestamp_ms: now_ms(),
+        msg_type: "PING".to_string(),
+    };
+    let payload =
+        serde_json::to_string(&message).map_err(|err| format!("json_error: {}", err))?;
+    let target = format!("{}:{}", addr, port);
+    let response = send_line_request(
+        &target,
+        &payload,
+        timeout_secs.unwrap_or(REQUEST_TIMEOUT_SECS),
+    )?;
+    print_control_response(&response);
+    Ok(())
+}
+
+fn send_hello(
+    addr: Option<String>,
+    port_override: Option<u16>,
+    device_id: Option<String>,
+    device_name: Option<String>,
+    capabilities: Option<Vec<String>>,
+    timeout_secs: Option<u64>,
+) -> Result<(), String> {
+    let config = load_config_or_default(&paths::config_file())?;
+    let identity = Identity::load_or_generate(&paths::identity_file())
+        .map_err(|err| format!("identity_load_failed: {}", err))?;
+    let sender_device_id = device_id.unwrap_or(identity.device_id);
+    let port = port_override.unwrap_or(config.listen_port);
+    let addr = addr.unwrap_or_else(|| "127.0.0.1".to_string());
+    let device_name = device_name
+        .or_else(|| config.device_name.clone())
+        .unwrap_or_else(default_device_name);
+    let capabilities = capabilities.unwrap_or_else(default_capabilities);
+
+    let message = HelloMessage {
+        version: 1,
+        msg_id: uuid::Uuid::new_v4().to_string(),
+        sender_device_id,
+        timestamp_ms: now_ms(),
+        msg_type: "HELLO".to_string(),
+        device_name,
+        capabilities,
+    };
+    let payload =
+        serde_json::to_string(&message).map_err(|err| format!("json_error: {}", err))?;
+    let target = format!("{}:{}", addr, port);
+    let response = send_line_request(
+        &target,
+        &payload,
+        timeout_secs.unwrap_or(REQUEST_TIMEOUT_SECS),
+    )?;
+    print_control_response(&response);
+    Ok(())
+}
+
+fn send_line_request(target: &str, payload: &str, timeout_secs: u64) -> Result<String, String> {
+    let mut stream = TcpStream::connect(target).map_err(|err| format!("connect_failed: {}", err))?;
+    let timeout = Duration::from_secs(timeout_secs);
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|err| format!("timeout_failed: {}", err))?;
@@ -541,11 +702,30 @@ fn send_pair_request(
     reader
         .read_line(&mut response)
         .map_err(|err| format!("read_failed: {}", err))?;
-    println!("{}", response.trim());
-    Ok(())
+    Ok(response.trim().to_string())
 }
 
-const PAIR_REQUEST_TIMEOUT_SECS: u64 = 10;
+fn print_control_response(response: &str) {
+    match serde_json::from_str::<ResponseBase>(response) {
+        Ok(parsed) if parsed.msg_type == "PONG" => {
+            println!("pong: ok");
+        }
+        Ok(parsed) if parsed.msg_type == "PAIR_REJECT" => {
+            if let Some(reason) = parsed.reason {
+                println!("reject: {}", reason);
+            } else {
+                println!("reject");
+            }
+        }
+        _ => println!("{}", response),
+    }
+}
+
+fn default_capabilities() -> Vec<String> {
+    vec!["clipboard".to_string(), "file".to_string()]
+}
+
+const REQUEST_TIMEOUT_SECS: u64 = 10;
 
 fn print_identity(identity_path: PathBuf, create_if_missing: bool) {
     if create_if_missing {

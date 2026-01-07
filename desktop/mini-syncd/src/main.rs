@@ -44,6 +44,26 @@ struct PairRequest {
     device_name: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct PingRequest {
+    version: u8,
+    msg_id: String,
+    sender_device_id: String,
+    timestamp_ms: u64,
+    msg_type: String,
+}
+
+#[derive(Deserialize)]
+struct HelloRequest {
+    version: u8,
+    msg_id: String,
+    sender_device_id: String,
+    timestamp_ms: u64,
+    msg_type: String,
+    device_name: String,
+    capabilities: Vec<String>,
+}
+
 #[derive(Serialize)]
 struct PairAccept {
     version: u8,
@@ -66,10 +86,20 @@ struct PairReject {
 }
 
 #[derive(Serialize)]
+struct Pong {
+    version: u8,
+    msg_id: String,
+    sender_device_id: String,
+    timestamp_ms: u64,
+    msg_type: String,
+}
+
+#[derive(Serialize)]
 #[serde(untagged)]
-enum PairResponse {
+enum ControlResponse {
     Accept(PairAccept),
     Reject(PairReject),
+    Pong(Pong),
 }
 
 fn main() {
@@ -207,7 +237,7 @@ fn handle_pairing_stream(
         return Err("pairing_empty_request".to_string());
     }
 
-    let response = handle_pairing_message(raw, identity, config_path, pairing_path);
+    let response = handle_control_message(raw, identity, config_path, pairing_path);
     let response_json =
         serde_json::to_string(&response).map_err(|err| format!("pairing_json_failed: {}", err))?;
     stream
@@ -219,24 +249,40 @@ fn handle_pairing_stream(
     Ok(())
 }
 
-fn handle_pairing_message(
+fn handle_control_message(
     raw: &str,
     identity: &Identity,
     config_path: &Path,
     pairing_path: &Path,
-) -> PairResponse {
+) -> ControlResponse {
     let base: BaseMessage = match serde_json::from_str(raw) {
         Ok(base) => base,
         Err(_) => return reject(identity, "invalid_json"),
     };
-    if base.msg_type != "PAIR_REQUEST" {
-        return reject(identity, "unsupported_msg_type");
+    match base.msg_type.as_str() {
+        "PAIR_REQUEST" => {
+            let request: PairRequest = match serde_json::from_str(raw) {
+                Ok(request) => request,
+                Err(_) => return reject(identity, "invalid_request"),
+            };
+            handle_pair_request(request, identity, config_path, pairing_path)
+        }
+        "PING" => {
+            let request: PingRequest = match serde_json::from_str(raw) {
+                Ok(request) => request,
+                Err(_) => return reject(identity, "invalid_request"),
+            };
+            handle_ping_request(request, identity, config_path)
+        }
+        "HELLO" => {
+            let request: HelloRequest = match serde_json::from_str(raw) {
+                Ok(request) => request,
+                Err(_) => return reject(identity, "invalid_request"),
+            };
+            handle_hello_request(request, identity, config_path)
+        }
+        _ => reject(identity, "unsupported_msg_type"),
     }
-    let request: PairRequest = match serde_json::from_str(raw) {
-        Ok(request) => request,
-        Err(_) => return reject(identity, "invalid_request"),
-    };
-    handle_pair_request(request, identity, config_path, pairing_path)
 }
 
 fn handle_pair_request(
@@ -244,7 +290,7 @@ fn handle_pair_request(
     identity: &Identity,
     config_path: &Path,
     pairing_path: &Path,
-) -> PairResponse {
+) -> ControlResponse {
     let _ = request.msg_id.as_str();
     let _ = request.timestamp_ms;
     if request.msg_type != "PAIR_REQUEST" {
@@ -288,8 +334,62 @@ fn handle_pair_request(
     accept(identity, session.code)
 }
 
-fn accept(identity: &Identity, code_confirm: String) -> PairResponse {
-    PairResponse::Accept(PairAccept {
+fn handle_ping_request(
+    request: PingRequest,
+    identity: &Identity,
+    config_path: &Path,
+) -> ControlResponse {
+    let _ = request.msg_id.as_str();
+    let _ = request.timestamp_ms;
+    if request.msg_type != "PING" {
+        return reject(identity, "invalid_msg_type");
+    }
+    if request.version != 1 {
+        return reject(identity, "unsupported_version");
+    }
+    if request.sender_device_id == identity.device_id {
+        return reject(identity, "self_ping_not_allowed");
+    }
+    let now = now_ms();
+    match update_paired_device(config_path, &request.sender_device_id, None, now) {
+        Ok(true) => pong(identity),
+        Ok(false) => reject(identity, "unpaired_device"),
+        Err(err) => reject(identity, &format!("config_error: {}", err)),
+    }
+}
+
+fn handle_hello_request(
+    request: HelloRequest,
+    identity: &Identity,
+    config_path: &Path,
+) -> ControlResponse {
+    let _ = request.msg_id.as_str();
+    let _ = request.timestamp_ms;
+    let _ = request.capabilities;
+    if request.msg_type != "HELLO" {
+        return reject(identity, "invalid_msg_type");
+    }
+    if request.version != 1 {
+        return reject(identity, "unsupported_version");
+    }
+    if request.sender_device_id == identity.device_id {
+        return reject(identity, "self_hello_not_allowed");
+    }
+    let now = now_ms();
+    match update_paired_device(
+        config_path,
+        &request.sender_device_id,
+        Some(&request.device_name),
+        now,
+    ) {
+        Ok(true) => pong(identity),
+        Ok(false) => reject(identity, "unpaired_device"),
+        Err(err) => reject(identity, &format!("config_error: {}", err)),
+    }
+}
+
+fn accept(identity: &Identity, code_confirm: String) -> ControlResponse {
+    ControlResponse::Accept(PairAccept {
         version: 1,
         msg_id: new_msg_id(),
         sender_device_id: identity.device_id.clone(),
@@ -300,14 +400,24 @@ fn accept(identity: &Identity, code_confirm: String) -> PairResponse {
     })
 }
 
-fn reject(identity: &Identity, reason: &str) -> PairResponse {
-    PairResponse::Reject(PairReject {
+fn reject(identity: &Identity, reason: &str) -> ControlResponse {
+    ControlResponse::Reject(PairReject {
         version: 1,
         msg_id: new_msg_id(),
         sender_device_id: identity.device_id.clone(),
         timestamp_ms: now_ms(),
         msg_type: "PAIR_REJECT".to_string(),
         reason: reason.to_string(),
+    })
+}
+
+fn pong(identity: &Identity) -> ControlResponse {
+    ControlResponse::Pong(Pong {
+        version: 1,
+        msg_id: new_msg_id(),
+        sender_device_id: identity.device_id.clone(),
+        timestamp_ms: now_ms(),
+        msg_type: "PONG".to_string(),
     })
 }
 
@@ -420,6 +530,30 @@ fn upsert_paired_device(
         .save(config_path)
         .map_err(|err| format!("config_save_failed: {}", err))?;
     Ok(())
+}
+
+fn update_paired_device(
+    config_path: &Path,
+    device_id: &str,
+    device_name: Option<&str>,
+    last_seen_ms: u64,
+) -> Result<bool, String> {
+    let mut config = load_config_or_default(config_path)?;
+    let existing = config
+        .paired_devices
+        .iter_mut()
+        .find(|device| device.device_id == device_id);
+    let Some(existing) = existing else {
+        return Ok(false);
+    };
+    if let Some(name) = device_name {
+        existing.device_name = Some(name.to_string());
+    }
+    existing.last_seen_ms = Some(last_seen_ms);
+    config
+        .save(config_path)
+        .map_err(|err| format!("config_save_failed: {}", err))?;
+    Ok(true)
 }
 
 fn load_config_or_default(config_path: &Path) -> Result<Config, String> {
