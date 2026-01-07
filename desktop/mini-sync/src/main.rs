@@ -7,9 +7,12 @@ use mini_sync_common::{
 };
 use qrcode::QrCode;
 use rand::RngCore;
+use serde::Serialize;
 use std::env;
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
 #[command(name = "mini-sync", version, about = "Minimal PC <-> Android sync CLI")]
@@ -44,6 +47,24 @@ enum Command {
         no_qr: bool,
         #[arg(long)]
         no_store: bool,
+    },
+    PairRequest {
+        #[arg(long)]
+        addr: Option<String>,
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long)]
+        code: Option<String>,
+        #[arg(long)]
+        sender_device_id: Option<String>,
+        #[arg(long)]
+        pubkey: Option<String>,
+        #[arg(long)]
+        device_name: Option<String>,
+        #[arg(long)]
+        timeout_secs: Option<u64>,
     },
     Unpair {
         device: String,
@@ -99,6 +120,30 @@ fn main() {
                 print_pairing_payload(addr, port, device_name, json, no_qr, no_store)
             {
                 eprintln!("pair_error: {}", err);
+                std::process::exit(1);
+            }
+        }
+        Command::PairRequest {
+            addr,
+            port,
+            token,
+            code,
+            sender_device_id,
+            pubkey,
+            device_name,
+            timeout_secs,
+        } => {
+            if let Err(err) = send_pair_request(
+                addr,
+                port,
+                token,
+                code,
+                sender_device_id,
+                pubkey,
+                device_name,
+                timeout_secs,
+            ) {
+                eprintln!("pair_request_error: {}", err);
                 std::process::exit(1);
             }
         }
@@ -410,6 +455,97 @@ fn default_device_name() -> String {
 }
 
 const PAIR_TOKEN_TTL_MS: u64 = 180_000;
+
+#[derive(Serialize)]
+struct PairRequestMessage {
+    version: u8,
+    msg_id: String,
+    sender_device_id: String,
+    timestamp_ms: u64,
+    msg_type: String,
+    token: String,
+    code: String,
+    pubkey: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_name: Option<String>,
+}
+
+fn send_pair_request(
+    addr: Option<String>,
+    port_override: Option<u16>,
+    token: Option<String>,
+    code: Option<String>,
+    sender_device_id: Option<String>,
+    pubkey: Option<String>,
+    device_name: Option<String>,
+    timeout_secs: Option<u64>,
+) -> Result<(), String> {
+    let config = load_config_or_default(&paths::config_file())?;
+    let pairing = PairingSession::load_optional(&paths::pairing_file())
+        .map_err(|err| format!("pairing_load_failed: {}", err))?;
+
+    let port = port_override
+        .or_else(|| pairing.as_ref().map(|session| session.port))
+        .unwrap_or(config.listen_port);
+    let addr = addr
+        .or_else(|| pairing.as_ref().and_then(|session| session.addr.clone()))
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let token = token
+        .or_else(|| pairing.as_ref().map(|session| session.token.clone()))
+        .ok_or_else(|| "missing token (use --token or create pairing session)".to_string())?;
+    let code = code
+        .or_else(|| pairing.as_ref().map(|session| session.code.clone()))
+        .ok_or_else(|| "missing code (use --code or create pairing session)".to_string())?;
+    let sender_device_id =
+        sender_device_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let pubkey = pubkey.unwrap_or_else(|| {
+        Identity::load_or_generate(&paths::identity_file())
+            .map(|identity| identity.public_key)
+            .unwrap_or_else(|_| "test-key".to_string())
+    });
+    let device_name = device_name.or_else(|| Some("mini-sync-cli".to_string()));
+
+    let message = PairRequestMessage {
+        version: 1,
+        msg_id: uuid::Uuid::new_v4().to_string(),
+        sender_device_id,
+        timestamp_ms: now_ms(),
+        msg_type: "PAIR_REQUEST".to_string(),
+        token,
+        code,
+        pubkey,
+        device_name,
+    };
+    let payload =
+        serde_json::to_string(&message).map_err(|err| format!("json_error: {}", err))?;
+
+    let target = format!("{}:{}", addr, port);
+    let mut stream =
+        TcpStream::connect(&target).map_err(|err| format!("connect_failed: {}", err))?;
+    let timeout = Duration::from_secs(timeout_secs.unwrap_or(PAIR_REQUEST_TIMEOUT_SECS));
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|err| format!("timeout_failed: {}", err))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|err| format!("timeout_failed: {}", err))?;
+    stream
+        .write_all(payload.as_bytes())
+        .map_err(|err| format!("write_failed: {}", err))?;
+    stream
+        .write_all(b"\n")
+        .map_err(|err| format!("write_failed: {}", err))?;
+
+    let mut response = String::new();
+    let mut reader = BufReader::new(stream);
+    reader
+        .read_line(&mut response)
+        .map_err(|err| format!("read_failed: {}", err))?;
+    println!("{}", response.trim());
+    Ok(())
+}
+
+const PAIR_REQUEST_TIMEOUT_SECS: u64 = 10;
 
 fn print_identity(identity_path: PathBuf, create_if_missing: bool) {
     if create_if_missing {

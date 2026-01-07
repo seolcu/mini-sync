@@ -21,6 +21,7 @@ Status: skeleton (M0). CLI/daemon stubs only.
 - Manual device entry (stub): `mini-sync pair --device-id <id> --pubkey <key> [--name <name>]`
 - Generate/load local identity: `mini-sync status` (writes `~/.local/state/mini-sync/identity.toml`)
 - Pairing QR payload (stub): `mini-sync pair` (use `--addr <ip>` / `--port <port>` as needed)
+- Send PAIR_REQUEST (dev helper): `mini-sync pair-request --addr <ip> --port <port>`
 - mDNS advertise/browse (daemon): `mini-syncd` (prints discovered services)
 - Pairing session is stored at `~/.local/state/mini-sync/pairing.toml` (use `--no-store` to skip)
 - Daemon listens on `listen_port` for JSON `PAIR_REQUEST` messages and replies with `PAIR_ACCEPT`/`PAIR_REJECT`
