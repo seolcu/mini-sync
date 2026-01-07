@@ -58,7 +58,8 @@
             "msg_type": { "const": "PAIR_REQUEST" },
             "token": { "type": "string" },
             "code": { "type": "string", "pattern": "^[0-9]{6}$" },
-            "pubkey": { "type": "string" }
+            "pubkey": { "type": "string" },
+            "device_name": { "type": "string" }
           },
           "required": ["token", "code", "pubkey"],
           "additionalProperties": false

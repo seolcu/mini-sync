@@ -459,6 +459,9 @@ dependencies = [
  "clap",
  "mdns-sd",
  "mini-sync-common",
+ "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]
